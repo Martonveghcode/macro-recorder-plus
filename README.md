@@ -41,10 +41,16 @@ pytest
 
 ## Export
 
-Use **Export Python Script** to create a standalone `.py` macro runner. The generated script supports:
+Use **Export Python Script** to create a standalone `.py` macro runner. Exports default to a
+`Macro Recorder Plus Exports` folder and include a `macro_recorder_plus_runtime` folder plus a
+generated `run_*.bat` launcher. Run the batch file to install `pynput` into the local runtime
+folder on first use, then start the macro.
+
+The generated script also supports direct CLI use:
 
 ```powershell
 python exported_macro.py
+python exported_macro.py --install-deps
 python exported_macro.py --speed 1.5
 python exported_macro.py --dry-run
 python exported_macro.py --start-action 12

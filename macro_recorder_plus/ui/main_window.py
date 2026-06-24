@@ -28,7 +28,7 @@ from PySide6.QtWidgets import (
 )
 
 from macro_recorder_plus.exporters.pyinstaller_exporter import PyInstallerExporter
-from macro_recorder_plus.exporters.python_exporter import PythonExporter
+from macro_recorder_plus.exporters.python_exporter import PythonExporter, default_export_directory, safe_script_filename
 from macro_recorder_plus.models.actions import ACTION_LABELS, ActionType, MacroAction, create_action
 from macro_recorder_plus.models.environment import current_environment
 from macro_recorder_plus.models.macro import MacroDocument
@@ -640,11 +640,15 @@ class MainWindow(QMainWindow):
 
     def export_python(self) -> None:
         self._sync_document()
-        path, _ = QFileDialog.getSaveFileName(self, "Export Python Script", "", "Python scripts (*.py)")
+        export_dir = Path(str(self.settings.value("export/directory", "")) or default_export_directory())
+        default_path = export_dir / safe_script_filename(self.document.name)
+        path, _ = QFileDialog.getSaveFileName(self, "Export Python Script", str(default_path), "Python scripts (*.py)")
         if not path:
             return
         target = PythonExporter().export(self.document, path)
-        self.status.showMessage(f"Exported {target.name}")
+        self.settings.setValue("export/directory", str(target.parent))
+        self.settings.sync()
+        self.status.showMessage(f"Exported {target.name} with runtime files")
 
     def export_exe(self) -> None:
         if importlib.util.find_spec("PyInstaller") is None:
@@ -654,7 +658,7 @@ class MainWindow(QMainWindow):
         output_dir = QFileDialog.getExistingDirectory(self, "Choose EXE output folder")
         if not output_dir:
             return
-        script_path = Path(output_dir) / f"{self.document.name.replace(' ', '_').lower()}_macro.py"
+        script_path = Path(output_dir) / safe_script_filename(self.document.name)
         PythonExporter().export(self.document, script_path)
         dialog = ExportDialog(self)
         self.export_process = PyInstallerExporter(self)

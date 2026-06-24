@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from macro_recorder_plus.exporters.python_exporter import default_export_directory
 from macro_recorder_plus.platform.windows_hotkeys import DEFAULT_HOTKEYS, validate_hotkey_conflicts
 
 
@@ -129,7 +130,7 @@ class SettingsDialog(QDialog):
         self.stop_hotkey.setText(str(self.settings.value("hotkeys/stop_recording", DEFAULT_HOTKEYS["stop_recording"])))
         self.pause_record_hotkey.setText(str(self.settings.value("hotkeys/pause_recording", DEFAULT_HOTKEYS["pause_recording"])))
         self.pause_play_hotkey.setText(str(self.settings.value("hotkeys/pause_playback", DEFAULT_HOTKEYS["pause_playback"])))
-        self.export_dir.setText(str(self.settings.value("export/directory", "")))
+        self.export_dir.setText(str(self.settings.value("export/directory", str(default_export_directory()))))
         self.python_path.setText(str(self.settings.value("export/python", "")))
         self.pyinstaller_path.setText(str(self.settings.value("export/pyinstaller", "")))
         self.exe_options.setText(str(self.settings.value("export/options", "")))
