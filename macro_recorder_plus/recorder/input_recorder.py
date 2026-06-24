@@ -75,6 +75,14 @@ class InputRecorder(QObject):
             self.started.emit()
         except Exception as exc:
             self._running = False
+            for listener in (self._keyboard_listener, self._mouse_listener):
+                if listener is not None:
+                    try:
+                        listener.stop()
+                    except Exception:
+                        pass
+            self._keyboard_listener = None
+            self._mouse_listener = None
             self.error.emit(str(exc))
 
     @Slot()

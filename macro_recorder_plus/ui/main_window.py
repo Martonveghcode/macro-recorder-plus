@@ -5,7 +5,7 @@ import logging
 import subprocess
 from pathlib import Path
 
-from PySide6.QtCore import QSettings, Qt, QUrl
+from PySide6.QtCore import QSettings, Qt, QTimer, QUrl, Slot
 from PySide6.QtGui import QAction, QCloseEvent, QDesktopServices, QIcon, QKeySequence, QUndoStack
 from PySide6.QtWidgets import (
     QApplication,
@@ -65,8 +65,8 @@ class MainWindow(QMainWindow):
         self.model = ActionTableModel(self.document.actions, self)
         self.model.dirtyChanged.connect(self._on_dirty_changed)
         self.recorder = InputRecorder(self)
-        self.recorder.actionRecorded.connect(self._append_recorded_action)
-        self.recorder.started.connect(lambda: self._set_state(AppState.RECORDING))
+        self.recorder.actionRecorded.connect(self._append_recorded_action, Qt.ConnectionType.QueuedConnection)
+        self.recorder.started.connect(self._recording_started)
         self.recorder.stopped.connect(self._recording_stopped)
         self.recorder.pausedChanged.connect(self._recording_pause_changed)
         self.recorder.error.connect(self._show_error)
@@ -86,6 +86,10 @@ class MainWindow(QMainWindow):
         self.hotkeys.registrationFailed.connect(lambda message: self.statusBar().showMessage(f"Hotkeys unavailable: {message}"))
 
         self.countdown = CountdownOverlay(self)
+        self.countdown_status_timer = QTimer(self)
+        self.countdown_status_timer.timeout.connect(self._update_countdown_status)
+        self.countdown_label = ""
+        self.countdown_total = 0
         self.export_process: PyInstallerExporter | None = None
         self.export_progress: QProgressDialog | None = None
 
@@ -322,9 +326,7 @@ class MainWindow(QMainWindow):
 
     def record_new_macro(self) -> None:
         if self.state == AppState.COUNTING_DOWN:
-            self.countdown.cancel()
-            self._set_state(AppState.IDLE)
-            self.status.showMessage("Countdown canceled")
+            self._cancel_countdown()
             return
         if self.playback.running:
             self.status.showMessage("Stop playback before recording")
@@ -342,12 +344,48 @@ class MainWindow(QMainWindow):
         self.model.replace_actions(self.document.actions)
         self.undo_stack.clear()
         self.recording_hidden = dialog.hide_check.isChecked()
+        self._start_countdown(
+            dialog.countdown_spin.value(),
+            "Recording",
+            lambda: self._begin_recording(dialog.options()),
+        )
+
+    def _start_countdown(self, seconds: int, label: str, callback) -> None:
+        self.countdown_label = label
+        self.countdown_total = max(0, int(seconds))
         self._set_state(AppState.COUNTING_DOWN)
-        self.countdown.start_countdown(dialog.countdown_spin.value(), lambda: self._begin_recording(dialog.options()))
+        self.progress.setRange(0, max(1, self.countdown_total))
+        self.progress.setValue(0)
+        self.countdown_status_timer.start(200)
+        self.countdown.start_countdown(self.countdown_total, lambda: self._finish_countdown(callback))
+        self._update_countdown_status()
+
+    def _finish_countdown(self, callback) -> None:
+        self.countdown_status_timer.stop()
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        callback()
+
+    def _cancel_countdown(self) -> None:
+        self.countdown.cancel()
+        self.countdown_status_timer.stop()
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        self._set_state(AppState.IDLE)
+        self.status.showMessage("Countdown canceled")
+
+    def _update_countdown_status(self) -> None:
+        if self.state != AppState.COUNTING_DOWN:
+            self.countdown_status_timer.stop()
+            return
+        remaining = max(0, self.countdown.remaining)
+        self.status.showMessage(f"{self.countdown_label} starts in {remaining}s. Press Stop or F9 to cancel.")
+        self.progress.setValue(max(0, self.countdown_total - remaining))
 
     def _begin_recording(self, options) -> None:
         if self.recording_hidden:
             self.showMinimized()
+        self.status.showMessage("Starting recording hooks...")
         try:
             from pynput import mouse
 
@@ -357,6 +395,13 @@ class MainWindow(QMainWindow):
             LOGGER.info("Could not capture initial cursor position: %s", exc)
         QApplication.beep()
         self.recorder.start(options)
+        if not self.recorder.running:
+            self.status.showMessage("Recording did not start. Check the error dialog or log.")
+
+    def _recording_started(self) -> None:
+        self._set_state(AppState.RECORDING)
+        self.progress.setRange(0, 0)
+        self.status.showMessage("Recording active. Press Stop or F9 to finish.")
 
     def stop_recording(self) -> None:
         self.recorder.stop()
@@ -375,13 +420,17 @@ class MainWindow(QMainWindow):
         if self.recording_hidden:
             self.showNormal()
             self.raise_()
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
         self._set_state(AppState.IDLE)
         self.status.showMessage(f"Recording loaded with {len(self.model.actions)} action(s)")
 
+    @Slot(object)
     def _append_recorded_action(self, action: MacroAction) -> None:
         self.model.insert_action(len(self.model.actions), action)
         last = self.model.index(len(self.model.actions) - 1, 0)
         self.table.scrollTo(last)
+        self.status.showMessage(f"Recorded {len(self.model.actions)} action(s). Press Stop or F9 to finish.")
 
     def run_macro(self) -> None:
         self._run_from_index(0)
@@ -400,8 +449,7 @@ class MainWindow(QMainWindow):
                 return
             self.document.settings["coordinate_mode"] = dialog.coordinate_mode
         countdown_seconds = int(self.settings.value("playback/countdown", 0))
-        self._set_state(AppState.COUNTING_DOWN)
-        self.countdown.start_countdown(countdown_seconds, lambda: self._start_playback(row))
+        self._start_countdown(countdown_seconds, "Playback", lambda: self._start_playback(row))
 
     def _start_playback(self, row: int) -> None:
         speed = float(self.settings.value("playback/speed", self.document.settings.get("playback_speed", 1.0)))
@@ -442,9 +490,7 @@ class MainWindow(QMainWindow):
 
     def stop_active(self) -> None:
         if self.state == AppState.COUNTING_DOWN:
-            self.countdown.cancel()
-            self._set_state(AppState.IDLE)
-            self.status.showMessage("Countdown canceled")
+            self._cancel_countdown()
             return
         if self.recorder.running:
             self.stop_recording()
@@ -629,9 +675,13 @@ class MainWindow(QMainWindow):
         self.act_pause_active.setEnabled(True)
         self.act_stop_active.setEnabled(True)
         self.act_pause_active.setText("Resume" if state in {AppState.RECORDING_PAUSED, AppState.PLAYBACK_PAUSED} else "Pause")
-        self.record_button.setText("Stop Recording" if is_recording else "Record")
+        if state == AppState.COUNTING_DOWN:
+            self.record_button.setText("Cancel Countdown")
+        else:
+            self.record_button.setText("Stop Recording" if is_recording else "Record")
         self.run_button.setEnabled(True)
         self.pause_button.setText("Resume" if state in {AppState.RECORDING_PAUSED, AppState.PLAYBACK_PAUSED} else "Pause")
+        self.stop_button.setText("Cancel" if state == AppState.COUNTING_DOWN else "Stop")
         self.stop_button.setEnabled(True)
         self.act_export_py.setEnabled(is_idle and bool(self.model.actions))
         self.act_export_exe.setEnabled(is_idle and bool(self.model.actions))
@@ -682,6 +732,8 @@ class MainWindow(QMainWindow):
             return
         self.recorder.stop()
         self.playback.stop()
+        self.countdown.cancel()
+        self.countdown_status_timer.stop()
         self.hotkeys.stop()
         self._save_window_state()
         event.accept()
