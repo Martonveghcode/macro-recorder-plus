@@ -4,6 +4,8 @@ from dataclasses import dataclass
 
 from PySide6.QtCore import QObject, Signal, Slot
 
+from macro_recorder_plus.models.actions import ActionType, MacroAction
+from macro_recorder_plus.models.environment import MonitorInfo, current_environment
 from macro_recorder_plus.platform.windows_input import keyboard_key_to_name, mouse_button_to_name
 from macro_recorder_plus.recorder.event_normalizer import EventNormalizer, NormalizerOptions
 from macro_recorder_plus.utilities.key_sequences import normalize_hotkey
@@ -36,6 +38,7 @@ class InputRecorder(QObject):
         self._paused = False
         self._held_keys: set[str] = set()
         self._last_click: tuple[str, int, int, float] | None = None
+        self._monitors: list[MonitorInfo] = []
         self._normalizer = EventNormalizer()
 
     @property
@@ -55,6 +58,7 @@ class InputRecorder(QObject):
             )
         )
         self._normalizer.reset(monotonic_seconds())
+        self._monitors = current_environment().monitors
 
         try:
             from pynput import keyboard, mouse
@@ -94,11 +98,34 @@ class InputRecorder(QObject):
         self._paused = not self._paused
         self.pausedChanged.emit(self._paused)
 
-    def _emit_actions(self, actions: list[object]) -> None:
+    def _emit_actions(self, actions: list[MacroAction]) -> None:
         if self._paused:
             return
         for action in actions:
+            self._annotate_monitor(action)
             self.actionRecorded.emit(action)
+
+    def _annotate_monitor(self, action: MacroAction) -> None:
+        if action.type not in {ActionType.MOUSE_MOVE, ActionType.MOUSE_BUTTON, ActionType.SCROLL}:
+            return
+        x = action.params.get("x")
+        y = action.params.get("y")
+        if x is None or y is None:
+            end = action.params.get("end")
+            if end:
+                x, y = end[0], end[1]
+        if x is None or y is None:
+            return
+        monitor = self._monitor_for_point(int(x), int(y))
+        if monitor:
+            action.params["monitor"] = monitor.identifier
+
+    def _monitor_for_point(self, x: int, y: int) -> MonitorInfo | None:
+        for monitor in self._monitors:
+            bounds = monitor.bounds
+            if bounds.left <= x < bounds.right and bounds.top <= y < bounds.bottom:
+                return monitor
+        return None
 
     def _on_key_press(self, key: object) -> None:
         if not self._running or not self.options.record_keyboard:

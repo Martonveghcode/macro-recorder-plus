@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import sys
+import os
 
-from PySide6.QtCore import QCoreApplication, QSettings
+from PySide6.QtCore import QCoreApplication, QSettings, QTimer
 from PySide6.QtWidgets import QApplication
 
 from macro_recorder_plus.platform.windows_dpi import set_process_dpi_awareness
@@ -19,4 +20,9 @@ def run() -> int:
     settings = QSettings()
     window = MainWindow(settings=settings, log_path=log_path)
     window.show()
+    smoke_exit_ms = os.environ.get("MACRO_RECORDER_PLUS_SMOKE_EXIT_MS")
+    if smoke_exit_ms:
+        delay = max(0, int(smoke_exit_ms))
+        QTimer.singleShot(delay, window.close)
+        QTimer.singleShot(delay + 250, app.quit)
     return app.exec()
