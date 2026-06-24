@@ -1,0 +1,75 @@
+{
+  "actions": [
+    {
+      "delay": 0.0,
+      "duration": 0.5,
+      "enabled": true,
+      "id": "example-wait",
+      "label": "Let the login page settle",
+      "params": {
+        "seconds": 0.5
+      },
+      "timestamp": 0.0,
+      "type": "wait"
+    },
+    {
+      "delay": 0.1,
+      "duration": 0.0,
+      "enabled": true,
+      "id": "example-username",
+      "label": "Type username",
+      "params": {
+        "text": "demo@example.com"
+      },
+      "timestamp": 0.6,
+      "type": "type_text"
+    },
+    {
+      "delay": 0.1,
+      "duration": 0.0,
+      "enabled": true,
+      "id": "example-tab",
+      "label": "Move to password field",
+      "params": {
+        "key": "tab",
+        "phase": "press_release"
+      },
+      "timestamp": 0.7,
+      "type": "key_press"
+    },
+    {
+      "delay": 0.1,
+      "duration": 0.0,
+      "enabled": true,
+      "id": "example-password",
+      "label": "Type password from env",
+      "params": {
+        "environment_variable": "WEBSITE_PASSWORD"
+      },
+      "timestamp": 0.8,
+      "type": "type_secret"
+    }
+  ],
+  "created_at": "2026-06-24T00:00:00+00:00",
+  "format_version": 1,
+  "name": "Example Login Macro",
+  "recorded_environment": {
+    "cursor_start": [
+      100,
+      100
+    ],
+    "monitors": [],
+    "platform": "Windows",
+    "virtual_desktop": {
+      "bottom": 1440,
+      "left": 0,
+      "right": 2560,
+      "top": 0
+    }
+  },
+  "settings": {
+    "coordinate_mode": "exact",
+    "playback_speed": 1.0
+  },
+  "updated_at": "2026-06-24T00:00:00+00:00"
+}
