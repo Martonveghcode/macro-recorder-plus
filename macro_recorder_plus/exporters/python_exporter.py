@@ -3,16 +3,20 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import sys
 from pathlib import Path
 from textwrap import dedent
 
+from macro_recorder_plus.models.actions import ActionType
 from macro_recorder_plus.models.macro import MacroDocument
 
 
 RUNTIME_DIR_NAME = "macro_recorder_plus_runtime"
 DEPENDENCIES_DIR_NAME = "dependencies"
-RUNTIME_REQUIREMENTS = ("pynput>=1.7.7",)
+ASSETS_DIR_NAME = "macro_recorder_plus_assets"
+RUNTIME_REQUIREMENTS = ("pynput>=1.7.7", "Pillow>=10", "numpy>=1.26")
+RUNTIME_IMPORT_DIRS = ("pynput", "PIL", "numpy")
 INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]+')
 
 
@@ -184,6 +188,189 @@ def mouse_move_points(action):
     return []
 
 
+def resolve_image_path(image_path):
+    path = Path(str(image_path)).expanduser()
+    if path.is_absolute():
+        return path
+    return SCRIPT_DIR / path
+
+
+def region_from_params(params):
+    width = int(params.get("region_width", 0) or 0)
+    height = int(params.get("region_height", 0) or 0)
+    if width <= 0 or height <= 0:
+        return None
+    return (
+        int(params.get("region_x", 0) or 0),
+        int(params.get("region_y", 0) or 0),
+        width,
+        height,
+    )
+
+
+def find_image_on_screen(params):
+    from PIL import Image, ImageGrab
+    import numpy as np
+
+    image_path = resolve_image_path(params.get("image_path", ""))
+    if not image_path.exists():
+        raise FileNotFoundError(f"Image not found: {image_path}")
+
+    template = Image.open(image_path)
+    confidence = min(1.0, max(0.0, float(params.get("confidence", 0.85))))
+    timeout = max(0.0, float(params.get("timeout", 5.0)))
+    poll_interval = max(0.05, float(params.get("poll_interval", 0.25)))
+    grayscale = bool(params.get("grayscale", True))
+    region = region_from_params(params)
+    deadline = time.perf_counter() + timeout
+
+    while True:
+        screenshot, offset_x, offset_y = grab_screen(ImageGrab, region)
+        match = locate_image_in_image(screenshot, template, np, confidence=confidence, grayscale=grayscale)
+        if match is not None:
+            x, y, width, height, score = match
+            return {
+                "x": x + offset_x,
+                "y": y + offset_y,
+                "width": width,
+                "height": height,
+                "confidence": score,
+                "center": (x + offset_x + width // 2, y + offset_y + height // 2),
+            }
+        if time.perf_counter() >= deadline:
+            return None
+        time.sleep(poll_interval)
+
+
+def grab_screen(image_grab_module, region):
+    if region is not None:
+        x, y, width, height = region
+        screenshot = image_grab_module.grab(bbox=(x, y, x + width, y + height))
+        return screenshot, int(x), int(y)
+    try:
+        screenshot = image_grab_module.grab(all_screens=True)
+        return screenshot, *virtual_screen_origin()
+    except TypeError:
+        return image_grab_module.grab(), 0, 0
+
+
+def virtual_screen_origin():
+    if not hasattr(ctypes, "windll"):
+        return (0, 0)
+    try:
+        user32 = ctypes.windll.user32
+        return (int(user32.GetSystemMetrics(76)), int(user32.GetSystemMetrics(77)))
+    except Exception:
+        return (0, 0)
+
+
+def locate_image_in_image(screenshot, template, np, *, confidence=0.85, grayscale=True, max_full_checks=2000):
+    screen_array = image_to_array(screenshot, np, grayscale=grayscale)
+    template_array = image_to_array(template, np, grayscale=grayscale)
+    screen_height, screen_width = screen_array.shape[:2]
+    template_height, template_width = template_array.shape[:2]
+    if template_width <= 0 or template_height <= 0:
+        return None
+    if template_width > screen_width or template_height > screen_height:
+        return None
+
+    candidate_height = screen_height - template_height + 1
+    candidate_width = screen_width - template_width + 1
+    mask = np.ones((candidate_height, candidate_width), dtype=bool)
+    sample_points = sample_points_for_template(template_width, template_height)
+    pixel_threshold = max(8.0, (1.0 - confidence) * 255.0 * 3.0)
+
+    for sample_x, sample_y in sample_points:
+        screen_slice = screen_array[sample_y : sample_y + candidate_height, sample_x : sample_x + candidate_width]
+        template_pixel = template_array[sample_y, sample_x]
+        diff = np.abs(screen_slice - template_pixel)
+        if diff.ndim == 3:
+            diff = diff.mean(axis=2)
+        mask &= diff <= pixel_threshold
+        if not mask.any():
+            return None
+
+    candidate_rows, candidate_cols = np.nonzero(mask)
+    if len(candidate_rows) == 0:
+        return None
+    if len(candidate_rows) > max_full_checks:
+        candidate_rows, candidate_cols = best_sampled_candidates(
+            screen_array,
+            template_array,
+            candidate_rows,
+            candidate_cols,
+            sample_points,
+            np,
+            max_full_checks,
+        )
+
+    best = None
+    for y, x in zip(candidate_rows, candidate_cols):
+        window = screen_array[y : y + template_height, x : x + template_width]
+        score = 1.0 - float(np.abs(window - template_array).mean()) / 255.0
+        if best is None or score > best[4]:
+            best = (int(x), int(y), template_width, template_height, score)
+    if best is None or best[4] < confidence:
+        return None
+    return best
+
+
+def image_to_array(image, np, *, grayscale):
+    converted = image.convert("L" if grayscale else "RGB")
+    return np.asarray(converted, dtype=np.float32)
+
+
+def sample_points_for_template(width, height):
+    x_values = sorted({0, width // 4, width // 2, (width * 3) // 4, width - 1})
+    y_values = sorted({0, height // 4, height // 2, (height * 3) // 4, height - 1})
+    points = [(x, y) for y in y_values for x in x_values]
+    step_x = max(1, width // 6)
+    step_y = max(1, height // 6)
+    for y in range(0, height, step_y):
+        for x in range(0, width, step_x):
+            points.append((min(width - 1, x), min(height - 1, y)))
+    return list(dict.fromkeys(points))
+
+
+def best_sampled_candidates(screen_array, template_array, candidate_rows, candidate_cols, sample_points, np, limit):
+    scores = np.zeros(len(candidate_rows), dtype=np.float32)
+    for sample_x, sample_y in sample_points:
+        screen_values = screen_array[candidate_rows + sample_y, candidate_cols + sample_x]
+        template_pixel = template_array[sample_y, sample_x]
+        diff = np.abs(screen_values - template_pixel)
+        if diff.ndim == 2:
+            diff = diff.mean(axis=1)
+        scores += diff
+    scores /= max(1, len(sample_points))
+    best_indexes = np.argsort(scores)[:limit]
+    return candidate_rows[best_indexes], candidate_cols[best_indexes]
+
+
+def execute_image_click(params, mouse_controller, mouse):
+    match = find_image_on_screen(params)
+    if match is None:
+        if params.get("on_not_found", "error") == "skip":
+            print(f"Image not found, skipping: {params.get('image_path', '')}", file=sys.stderr)
+            return
+        raise RuntimeError(f"Image not found on screen: {params.get('image_path', '')}")
+
+    mouse_controller.position = match["center"]
+    click_action = str(params.get("click_action", "left_click"))
+    if click_action == "move_only":
+        return
+    if click_action == "double_click":
+        button = button_from_name("left", mouse)
+        for _ in range(2):
+            mouse_controller.press(button)
+            mouse_controller.release(button)
+            time.sleep(0.05)
+        return
+
+    button = button_from_name(click_action.replace("_click", ""), mouse)
+    mouse_controller.press(button)
+    mouse_controller.release(button)
+
+
 def interpolated_mouse_points(points, hz=60):
     if len(points) <= 1:
         return points
@@ -348,6 +535,8 @@ def main():
             elif action_type == "scroll":
                 mouse_controller.position = (int(params.get("x", 0)), int(params.get("y", 0)))
                 mouse_controller.scroll(int(params.get("dx", 0)), int(params.get("dy", 0)))
+            elif action_type == "image_click":
+                execute_image_click(params, mouse_controller, mouse)
         return 0
     except KeyboardInterrupt:
         print("Interrupted", file=sys.stderr)
@@ -380,9 +569,41 @@ if __name__ == "__main__":
         if target.suffix.lower() != ".py":
             target = target.with_suffix(".py")
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(self.render(document), encoding="utf-8")
+        export_document = self._document_with_export_assets(document, target)
+        target.write_text(self.render(export_document), encoding="utf-8")
         self.write_support_files(target)
         return target
+
+    def _document_with_export_assets(self, document: MacroDocument, target: Path) -> MacroDocument:
+        export_document = MacroDocument.from_dict(document.to_dict())
+        asset_dir = target.parent / ASSETS_DIR_NAME
+        for action in export_document.actions:
+            if action.type != ActionType.IMAGE_CLICK:
+                continue
+            image_path = str(action.params.get("image_path", ""))
+            if not image_path:
+                continue
+            source = Path(image_path).expanduser()
+            if not source.is_absolute():
+                source = Path.cwd() / source
+            if not source.exists() or not source.is_file():
+                continue
+            asset_dir.mkdir(parents=True, exist_ok=True)
+            destination = self._unique_asset_path(asset_dir, source, action.id)
+            if source.resolve() != destination.resolve():
+                shutil.copy2(source, destination)
+            action.params["image_path"] = str(Path(ASSETS_DIR_NAME) / destination.name)
+        return export_document
+
+    def _unique_asset_path(self, asset_dir: Path, source: Path, action_id: str) -> Path:
+        stem = INVALID_FILENAME_CHARS.sub("_", source.stem).strip(" ._") or "image"
+        suffix = source.suffix or ".png"
+        candidate = asset_dir / f"{action_id[:8]}_{stem}{suffix}"
+        counter = 2
+        while candidate.exists() and candidate.resolve() != source.resolve():
+            candidate = asset_dir / f"{action_id[:8]}_{stem}_{counter}{suffix}"
+            counter += 1
+        return candidate
 
     def write_support_files(self, target: str | Path) -> None:
         target = Path(target)
@@ -392,46 +613,44 @@ if __name__ == "__main__":
         (runtime_dir / "install_dependencies.bat").write_text(self._install_batch(), encoding="utf-8")
         (target.parent / safe_batch_filename(target)).write_text(self._run_batch(target), encoding="utf-8")
         readme = target.parent / "README_exported_macros.txt"
-        if not readme.exists():
-            readme.write_text(self._readme_text(), encoding="utf-8")
+        readme.write_text(self._readme_text(), encoding="utf-8")
 
     def _install_batch(self) -> str:
         python_exe = str(Path(sys.executable))
-        return dedent(
-            f'''\
-            @echo off
-            setlocal
-            cd /d "%~dp0"
-            set "PYTHON_EXE={python_exe}"
-            if not exist "%PYTHON_EXE%" set "PYTHON_EXE=python"
-            if not exist "dependencies" mkdir "dependencies"
-            "%PYTHON_EXE%" -m pip install --upgrade --target "%~dp0dependencies" -r "%~dp0requirements.txt"
-            if errorlevel 1 (
-                echo Failed to install Macro Recorder + export dependencies.
-                pause
-                exit /b 1
-            )
-            echo Dependencies installed in "%~dp0dependencies".
-            '''
+        return (
+            "@echo off\n"
+            "setlocal\n"
+            'cd /d "%~dp0"\n'
+            f'set "PYTHON_EXE={python_exe}"\n'
+            'if not exist "%PYTHON_EXE%" set "PYTHON_EXE=python"\n'
+            'if not exist "dependencies" mkdir "dependencies"\n'
+            '"%PYTHON_EXE%" -m pip install --upgrade --target "%~dp0dependencies" -r "%~dp0requirements.txt"\n'
+            "if errorlevel 1 (\n"
+            "    echo Failed to install Macro Recorder + export dependencies.\n"
+            "    pause\n"
+            "    exit /b 1\n"
+            ")\n"
+            'echo Dependencies installed in "%~dp0dependencies".\n'
         )
 
     def _run_batch(self, target: Path) -> str:
         python_exe = str(Path(sys.executable))
-        return dedent(
-            f'''\
-            @echo off
-            setlocal
-            cd /d "%~dp0"
-            set "PYTHON_EXE={python_exe}"
-            if not exist "%PYTHON_EXE%" set "PYTHON_EXE=python"
-            set "RUNTIME_DIR=%~dp0{RUNTIME_DIR_NAME}"
-            set "DEPS_DIR=%RUNTIME_DIR%\\{DEPENDENCIES_DIR_NAME}"
-            if not exist "%DEPS_DIR%\\pynput" (
-                call "%RUNTIME_DIR%\\install_dependencies.bat"
-                if errorlevel 1 exit /b 1
-            )
-            "%PYTHON_EXE%" "%~dp0{target.name}" %*
-            '''
+        dependency_checks = "\n".join(f'if not exist "%DEPS_DIR%\\{name}" set "NEED_INSTALL=1"' for name in RUNTIME_IMPORT_DIRS)
+        return (
+            "@echo off\n"
+            "setlocal\n"
+            'cd /d "%~dp0"\n'
+            f'set "PYTHON_EXE={python_exe}"\n'
+            'if not exist "%PYTHON_EXE%" set "PYTHON_EXE=python"\n'
+            f'set "RUNTIME_DIR=%~dp0{RUNTIME_DIR_NAME}"\n'
+            f'set "DEPS_DIR=%RUNTIME_DIR%\\{DEPENDENCIES_DIR_NAME}"\n'
+            'set "NEED_INSTALL=0"\n'
+            f"{dependency_checks}\n"
+            'if "%NEED_INSTALL%"=="1" (\n'
+            '    call "%RUNTIME_DIR%\\install_dependencies.bat"\n'
+            "    if errorlevel 1 exit /b 1\n"
+            ")\n"
+            f'"%PYTHON_EXE%" "%~dp0{target.name}" %*\n'
         )
 
     def _readme_text(self) -> str:
@@ -439,8 +658,9 @@ if __name__ == "__main__":
             '''\
             Macro Recorder + exported Python macros
 
-            Run a macro with its generated run_*.bat file. The batch file installs pynput into
-            macro_recorder_plus_runtime\\dependencies on first run, then starts the exported script.
+            Run a macro with its generated run_*.bat file. The batch file installs runtime
+            dependencies into macro_recorder_plus_runtime\\dependencies on first run, then starts
+            the exported script. Image recognition templates are stored in macro_recorder_plus_assets.
 
             Useful direct commands:
               python your_macro.py --install-deps

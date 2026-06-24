@@ -3,11 +3,13 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import time
 import webbrowser
 from getpass import getpass
 from typing import Any
 
 from macro_recorder_plus.models.actions import ActionType, MacroAction
+from macro_recorder_plus.utilities.image_recognition import find_image_on_screen
 from macro_recorder_plus.utilities.key_sequences import normalize_key_name
 from macro_recorder_plus.utilities.validation import validate_url
 
@@ -184,6 +186,56 @@ class ActionExecutor:
                 if x is not None and y is not None:
                     self.mouse.position = (int(x), int(y))
                 self.mouse.scroll(int(action.params.get("dx", 0)), int(action.params.get("dy", 0)))
+            case ActionType.IMAGE_CLICK:
+                self._execute_image_click(action)
 
     def release_all(self) -> None:
         self.held.release_all()
+
+    def _execute_image_click(self, action: MacroAction) -> None:
+        image_path = str(action.params.get("image_path", ""))
+        if not image_path:
+            raise ValueError("Image action is missing an image path")
+        region = _region_from_params(action.params)
+        match = find_image_on_screen(
+            image_path,
+            confidence=float(action.params.get("confidence", 0.85)),
+            timeout=float(action.params.get("timeout", 5.0)),
+            poll_interval=float(action.params.get("poll_interval", 0.25)),
+            grayscale=bool(action.params.get("grayscale", True)),
+            region=region,
+        )
+        if match is None:
+            if str(action.params.get("on_not_found", "error")) == "skip":
+                return
+            raise ValueError(f"Image not found on screen: {image_path}")
+
+        self.mouse.position = match.center
+        click_action = str(action.params.get("click_action", "left_click"))
+        if click_action == "move_only":
+            return
+        if click_action == "double_click":
+            button = name_to_mouse_button("left")
+            for _ in range(2):
+                self.mouse.press(button)
+                self.mouse.release(button)
+                time.sleep(0.05)
+            return
+
+        button_name = click_action.replace("_click", "")
+        button = name_to_mouse_button(button_name)
+        self.mouse.press(button)
+        self.mouse.release(button)
+
+
+def _region_from_params(params: dict[str, Any]) -> tuple[int, int, int, int] | None:
+    width = int(params.get("region_width", 0) or 0)
+    height = int(params.get("region_height", 0) or 0)
+    if width <= 0 or height <= 0:
+        return None
+    return (
+        int(params.get("region_x", 0) or 0),
+        int(params.get("region_y", 0) or 0),
+        width,
+        height,
+    )

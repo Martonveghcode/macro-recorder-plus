@@ -5,7 +5,9 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
+    QFileDialog,
     QFormLayout,
+    QHBoxLayout,
     QLabel,
     QLineEdit,
     QPlainTextEdit,
@@ -145,6 +147,23 @@ class ActionProperties(QWidget):
                 self._add_int("dy", "Delta Y", int(params.get("dy", -1)), -1000, 1000)
                 self._add_int("x", "X", int(params.get("x", 0)), -100000, 100000)
                 self._add_int("y", "Y", int(params.get("y", 0)), -100000, 100000)
+            case ActionType.IMAGE_CLICK:
+                self._add_file("image_path", "Image", str(params.get("image_path", "")))
+                self._add_combo(
+                    "click_action",
+                    "Action",
+                    ["left_click", "right_click", "middle_click", "double_click", "move_only"],
+                    str(params.get("click_action", "left_click")),
+                )
+                self._add_double("confidence", "Min confidence", float(params.get("confidence", 0.85)), 0.1, 1.0)
+                self._add_double("timeout", "Timeout seconds", float(params.get("timeout", 5.0)), 0.0, 300.0)
+                self._add_double("poll_interval", "Poll interval", float(params.get("poll_interval", 0.25)), 0.05, 10.0)
+                self._add_bool("grayscale", "Grayscale match", bool(params.get("grayscale", True)))
+                self._add_combo("on_not_found", "If not found", ["error", "skip"], str(params.get("on_not_found", "error")))
+                self._add_int("region_x", "Region X", int(params.get("region_x", 0)), -100000, 100000)
+                self._add_int("region_y", "Region Y", int(params.get("region_y", 0)), -100000, 100000)
+                self._add_int("region_width", "Region width", int(params.get("region_width", 0)), 0, 100000)
+                self._add_int("region_height", "Region height", int(params.get("region_height", 0)), 0, 100000)
             case ActionType.COMMENT:
                 self._add_plain("text", "Text", str(params.get("text", "")))
 
@@ -183,6 +202,16 @@ class ActionProperties(QWidget):
             case ActionType.SCROLL:
                 for key in ["dx", "dy", "x", "y"]:
                     params[key] = self.param_widgets[key].value()
+            case ActionType.IMAGE_CLICK:
+                params["image_path"] = self.param_widgets["image_path"].text()
+                params["click_action"] = self.param_widgets["click_action"].currentText()
+                params["confidence"] = self.param_widgets["confidence"].value()
+                params["timeout"] = self.param_widgets["timeout"].value()
+                params["poll_interval"] = self.param_widgets["poll_interval"].value()
+                params["grayscale"] = self.param_widgets["grayscale"].isChecked()
+                params["on_not_found"] = self.param_widgets["on_not_found"].currentText()
+                for key in ["region_x", "region_y", "region_width", "region_height"]:
+                    params[key] = self.param_widgets[key].value()
             case ActionType.COMMENT:
                 params["text"] = self.param_widgets["text"].toPlainText()
         return params
@@ -199,6 +228,18 @@ class ActionProperties(QWidget):
         widget = QLineEdit(value)
         self.param_widgets[key] = widget
         self.params_form.addRow(label, widget)
+
+    def _add_file(self, key: str, label: str, value: str) -> None:
+        row = QWidget()
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        edit = QLineEdit(value)
+        button = QPushButton("Browse")
+        button.clicked.connect(lambda _checked=False, target=edit: self._browse_image(target))
+        layout.addWidget(edit, 1)
+        layout.addWidget(button)
+        self.param_widgets[key] = edit
+        self.params_form.addRow(label, row)
 
     def _add_plain(self, key: str, label: str, value: str) -> None:
         widget = QPlainTextEdit(value)
@@ -227,6 +268,16 @@ class ActionProperties(QWidget):
         widget.setValue(value)
         self.param_widgets[key] = widget
         self.params_form.addRow(label, widget)
+
+    def _browse_image(self, target: QLineEdit) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Choose Image",
+            target.text(),
+            "Images (*.png *.jpg *.jpeg *.bmp *.gif);;All files (*.*)",
+        )
+        if path:
+            target.setText(path)
 
     def _add_double(self, key: str, label: str, value: float, minimum: float, maximum: float) -> None:
         widget = QDoubleSpinBox()

@@ -17,6 +17,7 @@ class ActionType(str, Enum):
     MOUSE_MOVE = "mouse_move"
     MOUSE_BUTTON = "mouse_button"
     SCROLL = "scroll"
+    IMAGE_CLICK = "image_click"
     COMMENT = "comment"
 
 
@@ -31,6 +32,7 @@ ACTION_LABELS = {
     ActionType.MOUSE_MOVE: "Move Mouse",
     ActionType.MOUSE_BUTTON: "Mouse Button",
     ActionType.SCROLL: "Scroll",
+    ActionType.IMAGE_CLICK: "Find Image and Click",
     ActionType.COMMENT: "Comment",
 }
 
@@ -57,6 +59,19 @@ DEFAULT_PARAMS: dict[ActionType, dict[str, Any]] = {
     },
     ActionType.MOUSE_BUTTON: {"button": "left", "phase": "click", "x": 0, "y": 0},
     ActionType.SCROLL: {"dx": 0, "dy": -1, "x": 0, "y": 0},
+    ActionType.IMAGE_CLICK: {
+        "image_path": "",
+        "click_action": "left_click",
+        "confidence": 0.85,
+        "timeout": 5.0,
+        "poll_interval": 0.25,
+        "grayscale": True,
+        "on_not_found": "error",
+        "region_x": 0,
+        "region_y": 0,
+        "region_width": 0,
+        "region_height": 0,
+    },
     ActionType.COMMENT: {"text": ""},
 }
 
@@ -109,6 +124,10 @@ class MacroAction:
                 return f"{self.params.get('phase')} {self.params.get('button')}"
             case ActionType.SCROLL:
                 return f"dx={self.params.get('dx', 0)}, dy={self.params.get('dy', 0)}"
+            case ActionType.IMAGE_CLICK:
+                action = str(self.params.get("click_action", "left_click")).replace("_", " ")
+                image_path = str(self.params.get("image_path", ""))
+                return f"Find image and {action}: {image_path}"
             case ActionType.COMMENT:
                 return str(self.params.get("text", ""))
         return ACTION_LABELS[self.type]
@@ -130,6 +149,8 @@ class MacroAction:
                 return str(self.params.get("end", ""))
             case ActionType.MOUSE_BUTTON | ActionType.SCROLL:
                 return f"{self.params.get('x', '')}, {self.params.get('y', '')}"
+            case ActionType.IMAGE_CLICK:
+                return str(self.params.get("image_path", ""))
         return ""
 
     def clone(self, *, keep_id: bool = False) -> "MacroAction":

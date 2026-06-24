@@ -6,6 +6,7 @@ Macro Recorder + is a Windows-focused desktop macro recorder and player built wi
 
 - PySide6 and Qt Widgets provide the native desktop interface, model/view action table, menus, toolbars, dialogs, settings, and worker-thread integration required by the prompt.
 - pynput provides global keyboard/mouse hooks and playback controllers without requiring a browser, server, Electron, QML, or Tkinter.
+- Pillow and numpy support screenshot-based image recognition actions and exported macro playback.
 - ctypes calls declare Windows DPI awareness and inspect physical monitor layout without adding a pywin32 runtime dependency.
 - PyInstaller is optional and is launched through Qt `QProcess` so build output streams into the GUI.
 
@@ -42,9 +43,9 @@ pytest
 ## Export
 
 Use **Export Python Script** to create a standalone `.py` macro runner. Exports default to a
-`Macro Recorder Plus Exports` folder and include a `macro_recorder_plus_runtime` folder plus a
-generated `run_*.bat` launcher. Run the batch file to install `pynput` into the local runtime
-folder on first use, then start the macro.
+`Macro Recorder Plus Exports` folder and include a `macro_recorder_plus_runtime` folder, optional
+`macro_recorder_plus_assets` image templates, and a generated `run_*.bat` launcher. Run the batch
+file to install export dependencies into the local runtime folder on first use, then start the macro.
 
 The generated script also supports direct CLI use:
 
