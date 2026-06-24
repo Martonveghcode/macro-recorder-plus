@@ -22,6 +22,7 @@ class PythonExporter:
             import os
             import subprocess
             import sys
+            import threading
             import time
             import webbrowser
             from getpass import getpass
@@ -85,6 +86,9 @@ class PythonExporter:
 
                 keyboard_controller = keyboard.Controller()
                 mouse_controller = mouse.Controller()
+                stop_event = threading.Event()
+                hotkey_listener = keyboard.GlobalHotKeys({{"<f10>": stop_event.set}})
+                hotkey_listener.start()
                 held_keys = []
                 held_buttons = []
 
@@ -105,6 +109,9 @@ class PythonExporter:
                 try:
                     previous = 0.0
                     for index, action in enumerate(MACRO["actions"][args.start_action:], start=args.start_action):
+                        if stop_event.is_set():
+                            print("Emergency stop requested", file=sys.stderr)
+                            return 130
                         if not action.get("enabled", True):
                             continue
                         delay = max(0.0, float(action.get("delay", 0.0))) / max(0.01, args.speed)
@@ -182,6 +189,10 @@ class PythonExporter:
                     print(f"Playback failed: {{exc}}", file=sys.stderr)
                     return 1
                 finally:
+                    try:
+                        hotkey_listener.stop()
+                    except Exception:
+                        pass
                     release_all()
 
 

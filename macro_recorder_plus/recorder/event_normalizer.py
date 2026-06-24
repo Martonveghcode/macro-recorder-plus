@@ -66,6 +66,15 @@ class EventNormalizer:
             )
         ]
 
+    def add_hotkey(self, keys: list[str], now: float) -> list[MacroAction]:
+        return self.flush_mouse_move() + [
+            self._make_action(
+                ActionType.HOTKEY,
+                timestamp=now - self._start_time,
+                params={"keys": keys},
+            )
+        ]
+
     def add_mouse_button(self, x: int, y: int, button: str, phase: str, now: float) -> list[MacroAction]:
         return self.flush_mouse_move() + [
             self._make_action(

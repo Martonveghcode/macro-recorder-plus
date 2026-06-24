@@ -6,6 +6,7 @@ from PySide6.QtCore import QObject, Signal, Slot
 
 from macro_recorder_plus.platform.windows_input import keyboard_key_to_name, mouse_button_to_name
 from macro_recorder_plus.recorder.event_normalizer import EventNormalizer, NormalizerOptions
+from macro_recorder_plus.utilities.key_sequences import normalize_hotkey
 from macro_recorder_plus.utilities.timing import monotonic_seconds
 
 
@@ -33,6 +34,8 @@ class InputRecorder(QObject):
         self._mouse_listener = None
         self._running = False
         self._paused = False
+        self._held_keys: set[str] = set()
+        self._last_click: tuple[str, int, int, float] | None = None
         self._normalizer = EventNormalizer()
 
     @property
@@ -103,7 +106,13 @@ class InputRecorder(QObject):
         key_name = keyboard_key_to_name(key)
         if key_name in (self.options.ignored_keys or set()):
             return
-        self._emit_actions(self._normalizer.add_keyboard(key_name, "press", monotonic_seconds()))
+        now = monotonic_seconds()
+        self._held_keys.add(key_name)
+        modifiers = sorted(key for key in self._held_keys if _is_modifier(key))
+        if modifiers and not _is_modifier(key_name):
+            self._emit_actions(self._normalizer.add_hotkey(normalize_hotkey(modifiers + [key_name]), now))
+            return
+        self._emit_actions(self._normalizer.add_keyboard(key_name, "press", now))
 
     def _on_key_release(self, key: object) -> None:
         if not self._running or not self.options.record_keyboard:
@@ -111,6 +120,7 @@ class InputRecorder(QObject):
         key_name = keyboard_key_to_name(key)
         if key_name in (self.options.ignored_keys or set()):
             return
+        self._held_keys.discard(key_name)
         self._emit_actions(self._normalizer.add_keyboard(key_name, "release", monotonic_seconds()))
 
     def _on_mouse_move(self, x: int, y: int) -> None:
@@ -122,11 +132,27 @@ class InputRecorder(QObject):
         if not self._running:
             return
         phase = "press" if pressed else "release"
+        now = monotonic_seconds()
         self._emit_actions(
-            self._normalizer.add_mouse_button(x, y, mouse_button_to_name(button), phase, monotonic_seconds())
+            self._normalizer.add_mouse_button(x, y, mouse_button_to_name(button), phase, now)
         )
+        if not pressed:
+            button_name = mouse_button_to_name(button)
+            if self._is_double_click(button_name, int(x), int(y), now):
+                self._emit_actions(self._normalizer.add_mouse_button(x, y, button_name, "double_click", now))
+            self._last_click = (button_name, int(x), int(y), now)
 
     def _on_mouse_scroll(self, x: int, y: int, dx: int, dy: int) -> None:
         if not self._running or not self.options.record_scroll:
             return
         self._emit_actions(self._normalizer.add_scroll(x, y, dx, dy, monotonic_seconds()))
+
+    def _is_double_click(self, button: str, x: int, y: int, now: float) -> bool:
+        if self._last_click is None:
+            return False
+        last_button, last_x, last_y, last_time = self._last_click
+        return button == last_button and abs(x - last_x) <= 4 and abs(y - last_y) <= 4 and now - last_time <= 0.35
+
+
+def _is_modifier(key_name: str) -> bool:
+    return key_name in {"ctrl", "shift", "alt", "win"}

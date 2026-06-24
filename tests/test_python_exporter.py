@@ -16,5 +16,6 @@ def test_python_export_contains_cli_options_and_macro_data(tmp_path):
 
     assert "--dry-run" in text
     assert "--start-action" in text
+    assert "<f10>" in text
     assert "WEBSITE_PASSWORD" in text
     assert "set_dpi_awareness" in text

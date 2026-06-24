@@ -305,6 +305,13 @@ class MainWindow(QMainWindow):
     def _begin_recording(self, options) -> None:
         if self.recording_hidden:
             self.showMinimized()
+        try:
+            from pynput import mouse
+
+            x, y = mouse.Controller().position
+            self.document.recorded_environment.cursor_start = [int(x), int(y)]
+        except Exception as exc:
+            LOGGER.info("Could not capture initial cursor position: %s", exc)
         QApplication.beep()
         self.recorder.start(options)
 
@@ -352,9 +359,17 @@ class MainWindow(QMainWindow):
 
     def _start_playback(self, row: int) -> None:
         speed = float(self.settings.value("playback/speed", self.document.settings.get("playback_speed", 1.0)))
+        coordinate_mode = str(self.document.settings.get("coordinate_mode", self.settings.value("playback/coordinate_mode", "exact")))
         self.progress.setRange(0, max(1, len(self.model.actions) - row))
         self.progress.setValue(0)
-        self.playback.play(list(self.model.actions), start_index=row, speed=speed)
+        self.playback.play(
+            list(self.model.actions),
+            start_index=row,
+            speed=speed,
+            recorded_environment=self.document.recorded_environment,
+            current_environment_snapshot=current_environment(),
+            coordinate_mode=coordinate_mode,
+        )
         self._set_state(AppState.PLAYING)
 
     def pause_playback(self) -> None:
