@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QProgressDialog,
+    QPushButton,
     QSplitter,
     QStatusBar,
     QStyle,
@@ -78,10 +79,10 @@ class MainWindow(QMainWindow):
 
         self.hotkeys = HotkeyManager(self)
         self.hotkeys.startRecording.connect(self.record_new_macro)
-        self.hotkeys.stopRecording.connect(self.stop_recording)
-        self.hotkeys.pauseRecording.connect(self.pause_recording)
-        self.hotkeys.emergencyStop.connect(self.stop_playback)
-        self.hotkeys.pausePlayback.connect(self.pause_playback)
+        self.hotkeys.stopRecording.connect(self.stop_active)
+        self.hotkeys.pauseRecording.connect(self.pause_active)
+        self.hotkeys.emergencyStop.connect(self.stop_active)
+        self.hotkeys.pausePlayback.connect(self.pause_active)
         self.hotkeys.registrationFailed.connect(lambda message: self.statusBar().showMessage(f"Hotkeys unavailable: {message}"))
 
         self.countdown = CountdownOverlay(self)
@@ -120,11 +121,28 @@ class MainWindow(QMainWindow):
         self.act_run_selected = QAction("Run From Selected Action", self)
         self.act_run_selected.triggered.connect(self.run_from_selected)
 
-        self.act_pause_playback = QAction(style.standardIcon(QStyle.SP_MediaPause), "Pause Playback", self)
-        self.act_pause_playback.triggered.connect(self.pause_playback)
+        self.act_pause_active = QAction(style.standardIcon(QStyle.SP_MediaPause), "Pause", self)
+        self.act_pause_active.setShortcut(QKeySequence("F6"))
+        self.act_pause_active.triggered.connect(self.pause_active)
 
-        self.act_stop_playback = QAction(style.standardIcon(QStyle.SP_MediaStop), "Stop Playback", self)
-        self.act_stop_playback.triggered.connect(self.stop_playback)
+        self.act_stop_active = QAction(style.standardIcon(QStyle.SP_MediaStop), "Stop", self)
+        self.act_stop_active.setShortcut(QKeySequence("F9"))
+        self.act_stop_active.triggered.connect(self.stop_active)
+
+        self.act_pause_recording = QAction("Pause Recording", self)
+        self.act_pause_recording.setShortcut(QKeySequence("F7"))
+        self.act_pause_recording.triggered.connect(self.pause_recording)
+
+        self.act_emergency_stop = QAction("Emergency Stop", self)
+        self.act_emergency_stop.setShortcut(QKeySequence("F10"))
+        self.act_emergency_stop.triggered.connect(self.stop_active)
+
+        self.act_record_hotkey = QAction("Record Hotkey", self)
+        self.act_record_hotkey.setShortcut(QKeySequence("F8"))
+        self.act_record_hotkey.triggered.connect(self.record_new_macro)
+        self.addAction(self.act_record_hotkey)
+        self.addAction(self.act_pause_recording)
+        self.addAction(self.act_emergency_stop)
 
         self.act_export_py = QAction("Export Python Script", self)
         self.act_export_py.triggered.connect(self.export_python)
@@ -196,8 +214,8 @@ class MainWindow(QMainWindow):
         playback_menu = self.menuBar().addMenu("&Playback")
         playback_menu.addAction(self.act_run)
         playback_menu.addAction(self.act_run_selected)
-        playback_menu.addAction(self.act_pause_playback)
-        playback_menu.addAction(self.act_stop_playback)
+        playback_menu.addAction(self.act_pause_active)
+        playback_menu.addAction(self.act_stop_active)
 
         tools_menu = self.menuBar().addMenu("&Tools")
         tools_menu.addAction(self.act_settings)
@@ -206,7 +224,7 @@ class MainWindow(QMainWindow):
         toolbar = QToolBar("Main Toolbar", self)
         toolbar.setMovable(False)
         self.addToolBar(toolbar)
-        for action in [self.act_new, self.act_open, self.act_save, self.act_run, self.act_pause_playback, self.act_stop_playback]:
+        for action in [self.act_new, self.act_open, self.act_save, self.act_run, self.act_pause_active, self.act_stop_active]:
             toolbar.addAction(action)
         toolbar.addSeparator()
         toolbar.addAction(self.act_export_py)
@@ -215,10 +233,27 @@ class MainWindow(QMainWindow):
         central = QWidget(self)
         central_layout = QVBoxLayout(central)
         controls = QHBoxLayout()
+        self.record_button = QPushButton("Record")
+        self.record_button.setToolTip("Record new macro (F8)")
+        self.record_button.clicked.connect(self.record_new_macro)
+        self.run_button = QPushButton("Run")
+        self.run_button.setToolTip("Run macro from the beginning")
+        self.run_button.clicked.connect(self.run_macro)
+        self.pause_button = QPushButton("Pause")
+        self.pause_button.setToolTip("Pause or resume recording/playback")
+        self.pause_button.clicked.connect(self.pause_active)
+        self.stop_button = QPushButton("Stop")
+        self.stop_button.setToolTip("Stop recording/playback or cancel countdown")
+        self.stop_button.clicked.connect(self.stop_active)
         self.state_label = QLabel(AppState.IDLE.value)
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
+        controls.addWidget(self.record_button)
+        controls.addWidget(self.run_button)
+        controls.addWidget(self.pause_button)
+        controls.addWidget(self.stop_button)
+        controls.addSpacing(16)
         controls.addWidget(QLabel("State"))
         controls.addWidget(self.state_label)
         controls.addStretch(1)
@@ -286,6 +321,14 @@ class MainWindow(QMainWindow):
         menu.exec(self.table.viewport().mapToGlobal(position))
 
     def record_new_macro(self) -> None:
+        if self.state == AppState.COUNTING_DOWN:
+            self.countdown.cancel()
+            self._set_state(AppState.IDLE)
+            self.status.showMessage("Countdown canceled")
+            return
+        if self.playback.running:
+            self.status.showMessage("Stop playback before recording")
+            return
         if self.state in {AppState.RECORDING, AppState.RECORDING_PAUSED}:
             self.stop_recording()
             return
@@ -319,7 +362,10 @@ class MainWindow(QMainWindow):
         self.recorder.stop()
 
     def pause_recording(self) -> None:
-        self.recorder.pause_or_resume()
+        if self.recorder.running:
+            self.recorder.pause_or_resume()
+        else:
+            self.status.showMessage("Recording is not active")
 
     def _recording_pause_changed(self, paused: bool) -> None:
         self._set_state(AppState.RECORDING_PAUSED if paused else AppState.RECORDING)
@@ -376,9 +422,37 @@ class MainWindow(QMainWindow):
         if self.playback.running:
             self.playback.pause_or_resume()
             self._set_state(AppState.PLAYBACK_PAUSED if self.state == AppState.PLAYING else AppState.PLAYING)
+        else:
+            self.status.showMessage("Playback is not active")
 
     def stop_playback(self) -> None:
-        self.playback.stop()
+        if self.playback.running:
+            self.playback.stop()
+        else:
+            self.status.showMessage("Playback is not active")
+
+    def pause_active(self) -> None:
+        if self.recorder.running:
+            self.pause_recording()
+            return
+        if self.playback.running:
+            self.pause_playback()
+            return
+        self.status.showMessage("Nothing to pause")
+
+    def stop_active(self) -> None:
+        if self.state == AppState.COUNTING_DOWN:
+            self.countdown.cancel()
+            self._set_state(AppState.IDLE)
+            self.status.showMessage("Countdown canceled")
+            return
+        if self.recorder.running:
+            self.stop_recording()
+            return
+        if self.playback.running:
+            self.stop_playback()
+            return
+        self.status.showMessage("Nothing to stop")
 
     def _playback_progress(self, row: int, action: MacroAction) -> None:
         self.model.set_playback_row(row)
@@ -547,13 +621,18 @@ class MainWindow(QMainWindow):
         is_idle = state == AppState.IDLE
         is_recording = state in {AppState.RECORDING, AppState.RECORDING_PAUSED}
         is_playing = state in {AppState.PLAYING, AppState.PLAYBACK_PAUSED}
-        self.act_new.setEnabled(not is_playing)
+        self.act_new.setEnabled(True)
         self.act_open.setEnabled(is_idle)
         self.act_save.setEnabled(is_idle)
-        self.act_run.setEnabled(is_idle and bool(self.model.actions))
+        self.act_run.setEnabled(True)
         self.act_run_selected.setEnabled(is_idle and bool(self.model.actions))
-        self.act_pause_playback.setEnabled(is_playing)
-        self.act_stop_playback.setEnabled(is_playing)
+        self.act_pause_active.setEnabled(True)
+        self.act_stop_active.setEnabled(True)
+        self.act_pause_active.setText("Resume" if state in {AppState.RECORDING_PAUSED, AppState.PLAYBACK_PAUSED} else "Pause")
+        self.record_button.setText("Stop Recording" if is_recording else "Record")
+        self.run_button.setEnabled(True)
+        self.pause_button.setText("Resume" if state in {AppState.RECORDING_PAUSED, AppState.PLAYBACK_PAUSED} else "Pause")
+        self.stop_button.setEnabled(True)
         self.act_export_py.setEnabled(is_idle and bool(self.model.actions))
         self.act_export_exe.setEnabled(is_idle and bool(self.model.actions))
         self.act_delete.setEnabled(is_idle)

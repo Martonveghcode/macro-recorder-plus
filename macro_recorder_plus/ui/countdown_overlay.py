@@ -53,3 +53,8 @@ class CountdownOverlay(QDialog):
             callback = self.finished_callback
             self.finished_callback = None
             callback()
+
+    def cancel(self) -> None:
+        self.timer.stop()
+        self.finished_callback = None
+        self.hide()
