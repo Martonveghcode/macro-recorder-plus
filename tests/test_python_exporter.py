@@ -19,3 +19,5 @@ def test_python_export_contains_cli_options_and_macro_data(tmp_path):
     assert "<f10>" in text
     assert "WEBSITE_PASSWORD" in text
     assert "set_dpi_awareness" in text
+    assert "interpolated_mouse_points" in text
+    assert "mouse_move_points" in text

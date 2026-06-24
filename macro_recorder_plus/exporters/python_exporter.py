@@ -19,6 +19,7 @@ class PythonExporter:
             import argparse
             import ctypes
             import json
+            import math
             import os
             import subprocess
             import sys
@@ -68,6 +69,55 @@ class PythonExporter:
 
             def button_from_name(name, mouse):
                 return getattr(mouse.Button, str(name).lower().replace("button.", ""))
+
+
+            def mouse_move_points(action):
+                params = action.get("params", {{}})
+                points = []
+                for point in params.get("path", []) or []:
+                    if len(point) >= 3:
+                        points.append((int(point[0]), int(point[1]), float(point[2])))
+                if points:
+                    return points
+                start = params.get("start")
+                end = params.get("end")
+                if start and end:
+                    return [
+                        (int(start[0]), int(start[1]), float(action.get("timestamp", 0))),
+                        (int(end[0]), int(end[1]), float(action.get("timestamp", 0)) + float(action.get("duration", 0))),
+                    ]
+                if end:
+                    return [(int(end[0]), int(end[1]), 0.0)]
+                return []
+
+
+            def interpolated_mouse_points(points, hz=60):
+                if len(points) <= 1:
+                    return points
+                first_time = points[0][2]
+                output = [(points[0][0], points[0][1], 0.0)]
+                for previous, current in zip(points, points[1:]):
+                    x1, y1, t1 = previous
+                    x2, y2, t2 = current
+                    segment_duration = max(0.0, t2 - t1)
+                    steps = max(1, math.ceil(segment_duration * hz))
+                    for step in range(1, steps + 1):
+                        alpha = step / steps
+                        x = round(x1 + (x2 - x1) * alpha)
+                        y = round(y1 + (y2 - y1) * alpha)
+                        relative_time = max(0.0, (t1 - first_time) + (segment_duration * alpha))
+                        output.append((x, y, relative_time))
+                return output
+
+
+            def sleep_until(target, stop_event):
+                while True:
+                    if stop_event.is_set():
+                        return False
+                    remaining = target - time.perf_counter()
+                    if remaining <= 0:
+                        return True
+                    time.sleep(min(remaining, 0.005))
 
 
             def main():
@@ -163,8 +213,12 @@ class PythonExporter:
                                 keyboard_controller.release(key)
                                 held_keys.pop()
                         elif action_type == "mouse_move":
-                            end = params.get("end", [0, 0])
-                            mouse_controller.position = (int(end[0]), int(end[1]))
+                            start_time = time.perf_counter()
+                            for x, y, relative_time in interpolated_mouse_points(mouse_move_points(action)):
+                                if not sleep_until(start_time + (relative_time / max(0.01, args.speed)), stop_event):
+                                    print("Emergency stop requested", file=sys.stderr)
+                                    return 130
+                                mouse_controller.position = (int(x), int(y))
                         elif action_type == "mouse_button":
                             mouse_controller.position = (int(params.get("x", 0)), int(params.get("y", 0)))
                             button = button_from_name(params.get("button", "left"), mouse)
