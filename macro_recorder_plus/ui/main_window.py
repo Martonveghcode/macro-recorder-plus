@@ -35,7 +35,7 @@ from macro_recorder_plus.models.environment import current_environment
 from macro_recorder_plus.models.macro import MacroDocument
 from macro_recorder_plus.platform.windows_hotkeys import DEFAULT_HOTKEYS, HotkeyManager
 from macro_recorder_plus.playback.playback_engine import PlaybackEngine
-from macro_recorder_plus.recorder.input_recorder import InputRecorder
+from macro_recorder_plus.recorder.input_recorder import InputRecorder, RecordingOptions
 from macro_recorder_plus.storage.json_store import MacroFileError, load_macro, save_macro
 from macro_recorder_plus.ui.action_properties import ActionProperties
 from macro_recorder_plus.ui.action_table_model import ActionTableModel
@@ -105,6 +105,9 @@ class MainWindow(QMainWindow):
         self.act_new = QAction(style.standardIcon(QStyle.SP_FileIcon), "Record New Macro", self)
         self.act_new.setShortcut(QKeySequence.New)
         self.act_new.triggered.connect(self.record_new_macro)
+
+        self.act_record_setup = QAction("Recording Setup...", self)
+        self.act_record_setup.triggered.connect(self.record_new_macro_with_setup)
 
         self.act_open = QAction(style.standardIcon(QStyle.SP_DialogOpenButton), "Open Macro", self)
         self.act_open.setShortcut(QKeySequence.Open)
@@ -190,6 +193,7 @@ class MainWindow(QMainWindow):
 
         file_menu = self.menuBar().addMenu("&File")
         file_menu.addAction(self.act_new)
+        file_menu.addAction(self.act_record_setup)
         file_menu.addAction(self.act_open)
         self.recent_menu = file_menu.addMenu("Recent Files")
         file_menu.addSeparator()
@@ -325,6 +329,17 @@ class MainWindow(QMainWindow):
         menu.exec(self.table.viewport().mapToGlobal(position))
 
     def record_new_macro(self) -> None:
+        options = RecordingOptions(
+            record_mouse_movement=True,
+            record_keyboard=True,
+            record_scroll=True,
+            mouse_sample_hz=60,
+            simplification_tolerance=2.0,
+            ignored_keys={"f8", "f9", "f7", "f10", "f6"},
+        )
+        self._start_new_recording(options=options, countdown_seconds=0, hide_during_recording=False)
+
+    def record_new_macro_with_setup(self) -> None:
         if self.state == AppState.COUNTING_DOWN:
             self._cancel_countdown()
             return
@@ -339,15 +354,40 @@ class MainWindow(QMainWindow):
         dialog = RecordingDialog(self)
         if dialog.exec() != dialog.Accepted:
             return
+        self._start_new_recording(
+            options=dialog.options(),
+            countdown_seconds=dialog.countdown_spin.value(),
+            hide_during_recording=dialog.hide_check.isChecked(),
+        )
+
+    def _start_new_recording(
+        self,
+        *,
+        options: RecordingOptions,
+        countdown_seconds: int,
+        hide_during_recording: bool,
+    ) -> None:
+        if self.state == AppState.COUNTING_DOWN:
+            self._cancel_countdown()
+            return
+        if self.playback.running:
+            self.status.showMessage("Stop playback before recording")
+            return
+        if self.state in {AppState.RECORDING, AppState.RECORDING_PAUSED}:
+            self.stop_recording()
+            return
+        if not self._maybe_save():
+            return
         self.document = MacroDocument(name="Recorded Macro", recorded_environment=current_environment())
         self.current_path = None
         self.model.replace_actions(self.document.actions)
         self.undo_stack.clear()
-        self.recording_hidden = dialog.hide_check.isChecked()
+        self.recording_hidden = hide_during_recording
+        self.status.showMessage("Starting recording...")
         self._start_countdown(
-            dialog.countdown_spin.value(),
+            countdown_seconds,
             "Recording",
-            lambda: self._begin_recording(dialog.options()),
+            lambda: self._begin_recording(options),
         )
 
     def _start_countdown(self, seconds: int, label: str, callback) -> None:

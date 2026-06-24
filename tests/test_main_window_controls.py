@@ -4,6 +4,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QSettings
 
+from macro_recorder_plus.recorder.input_recorder import RecordingOptions
 from macro_recorder_plus.ui.state import AppState
 from macro_recorder_plus.ui.main_window import MainWindow
 
@@ -44,3 +45,23 @@ def test_countdown_has_visible_main_window_feedback(tmp_path, qtbot):
     assert window.stop_button.text() == "Cancel"
     assert "Recording starts in" in window.status.currentMessage()
     window._cancel_countdown()
+
+
+def test_record_command_uses_direct_recording_path(tmp_path, qtbot):
+    settings = QSettings(str(tmp_path / "settings.ini"), QSettings.IniFormat)
+    window = MainWindow(settings=settings, log_path=Path(tmp_path / "app.log"))
+    qtbot.addWidget(window)
+    calls = []
+
+    def fake_start_new_recording(*, options, countdown_seconds, hide_during_recording):
+        calls.append((options, countdown_seconds, hide_during_recording))
+
+    window._start_new_recording = fake_start_new_recording
+
+    window.record_new_macro()
+
+    assert len(calls) == 1
+    options, countdown_seconds, hide_during_recording = calls[0]
+    assert isinstance(options, RecordingOptions)
+    assert countdown_seconds == 0
+    assert hide_during_recording is False
