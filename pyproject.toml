@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "macro-recorder-plus"
+version = "0.1.0"
+description = "A desktop keyboard and mouse macro recorder."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "pynput>=1.7.7",
+]
+
+[project.scripts]
+macro-recorder-plus = "macro_recorder_plus.app:main"
+
+[tool.setuptools.packages.find]
+include = ["macro_recorder_plus*"]
