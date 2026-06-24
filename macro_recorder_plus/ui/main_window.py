@@ -8,7 +8,6 @@ from pathlib import Path
 from PySide6.QtCore import QSettings, Qt, QTimer, QUrl, Slot
 from PySide6.QtGui import QAction, QCloseEvent, QDesktopServices, QIcon, QKeySequence, QUndoStack
 from PySide6.QtWidgets import (
-    QApplication,
     QFileDialog,
     QHBoxLayout,
     QLabel,
@@ -46,6 +45,7 @@ from macro_recorder_plus.ui.monitor_warning_dialog import MonitorWarningDialog
 from macro_recorder_plus.ui.recording_dialog import RecordingDialog
 from macro_recorder_plus.ui.settings_dialog import SettingsDialog
 from macro_recorder_plus.ui.state import AppState
+from macro_recorder_plus.utilities.sound import play_notification
 
 
 LOGGER = logging.getLogger(__name__)
@@ -254,6 +254,13 @@ class MainWindow(QMainWindow):
         self.stop_button.setToolTip("Stop recording/playback or cancel countdown")
         self.stop_button.clicked.connect(self.stop_active)
         self.state_label = QLabel(AppState.IDLE.value)
+        self.countdown_banner = QLabel("")
+        self.countdown_banner.setAlignment(Qt.AlignCenter)
+        self.countdown_banner.hide()
+        countdown_font = self.countdown_banner.font()
+        countdown_font.setPointSize(20)
+        countdown_font.setBold(True)
+        self.countdown_banner.setFont(countdown_font)
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
@@ -268,6 +275,7 @@ class MainWindow(QMainWindow):
         controls.addWidget(QLabel("Progress"))
         controls.addWidget(self.progress)
         central_layout.addLayout(controls)
+        central_layout.addWidget(self.countdown_banner)
 
         splitter = QSplitter(Qt.Horizontal)
         self.table = QTableView()
@@ -337,7 +345,7 @@ class MainWindow(QMainWindow):
             simplification_tolerance=2.0,
             ignored_keys={"f8", "f9", "f7", "f10", "f6"},
         )
-        self._start_new_recording(options=options, countdown_seconds=0, hide_during_recording=False)
+        self._start_new_recording(options=options, countdown_seconds=5, hide_during_recording=False)
 
     def record_new_macro_with_setup(self) -> None:
         if self.state == AppState.COUNTING_DOWN:
@@ -394,6 +402,7 @@ class MainWindow(QMainWindow):
         self.countdown_label = label
         self.countdown_total = max(0, int(seconds))
         self._set_state(AppState.COUNTING_DOWN)
+        self.countdown_banner.show()
         self.progress.setRange(0, max(1, self.countdown_total))
         self.progress.setValue(0)
         self.countdown_status_timer.start(200)
@@ -402,6 +411,7 @@ class MainWindow(QMainWindow):
 
     def _finish_countdown(self, callback) -> None:
         self.countdown_status_timer.stop()
+        self.countdown_banner.hide()
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
         callback()
@@ -409,6 +419,7 @@ class MainWindow(QMainWindow):
     def _cancel_countdown(self) -> None:
         self.countdown.cancel()
         self.countdown_status_timer.stop()
+        self.countdown_banner.hide()
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
         self._set_state(AppState.IDLE)
@@ -419,7 +430,9 @@ class MainWindow(QMainWindow):
             self.countdown_status_timer.stop()
             return
         remaining = max(0, self.countdown.remaining)
-        self.status.showMessage(f"{self.countdown_label} starts in {remaining}s. Press Stop or F9 to cancel.")
+        message = f"{self.countdown_label} starts in {remaining}s. Press Stop or F9 to cancel."
+        self.countdown_banner.setText(message)
+        self.status.showMessage(message)
         self.progress.setValue(max(0, self.countdown_total - remaining))
 
     def _begin_recording(self, options) -> None:
@@ -433,7 +446,7 @@ class MainWindow(QMainWindow):
             self.document.recorded_environment.cursor_start = [int(x), int(y)]
         except Exception as exc:
             LOGGER.info("Could not capture initial cursor position: %s", exc)
-        QApplication.beep()
+        play_notification()
         self.recorder.start(options)
         if not self.recorder.running:
             self.status.showMessage("Recording did not start. Check the error dialog or log.")
@@ -456,7 +469,7 @@ class MainWindow(QMainWindow):
         self._set_state(AppState.RECORDING_PAUSED if paused else AppState.RECORDING)
 
     def _recording_stopped(self) -> None:
-        QApplication.beep()
+        play_notification()
         if self.recording_hidden:
             self.showNormal()
             self.raise_()

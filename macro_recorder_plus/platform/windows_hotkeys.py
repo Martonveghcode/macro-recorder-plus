@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from PySide6.QtCore import QObject, Signal
 
+from macro_recorder_plus.utilities.key_sequences import normalize_key_name
+
 
 DEFAULT_HOTKEYS = {
     "start_recording": "<f8>",
@@ -30,15 +32,21 @@ class HotkeyManager(QObject):
         try:
             from pynput import keyboard
 
-            self._listener = keyboard.GlobalHotKeys(
-                {
-                    mapping.get("start_recording", "<f8>"): self.startRecording.emit,
-                    mapping.get("stop_recording", "<f9>"): self.stopRecording.emit,
-                    mapping.get("pause_recording", "<f7>"): self.pauseRecording.emit,
-                    mapping.get("emergency_stop", "<f10>"): self.emergencyStop.emit,
-                    mapping.get("pause_playback", "<f6>"): self.pausePlayback.emit,
-                }
-            )
+            callbacks = {
+                _normalize_hotkey(mapping.get("start_recording", "<f8>")): self.startRecording.emit,
+                _normalize_hotkey(mapping.get("stop_recording", "<f9>")): self.stopRecording.emit,
+                _normalize_hotkey(mapping.get("pause_recording", "<f7>")): self.pauseRecording.emit,
+                _normalize_hotkey(mapping.get("emergency_stop", "<f10>")): self.emergencyStop.emit,
+                _normalize_hotkey(mapping.get("pause_playback", "<f6>")): self.pausePlayback.emit,
+            }
+
+            def on_release(key: object) -> None:
+                key_name = normalize_key_name(str(key))
+                callback = callbacks.get(key_name)
+                if callback is not None:
+                    callback()
+
+            self._listener = keyboard.Listener(on_release=on_release)
             self._listener.start()
         except Exception as exc:
             self._listener = None
@@ -53,6 +61,13 @@ class HotkeyManager(QObject):
 
 
 def validate_hotkey_conflicts(hotkeys: dict[str, str]) -> list[str]:
-    normalized = [value.strip().lower() for value in hotkeys.values() if value.strip()]
+    normalized = [_normalize_hotkey(value) for value in hotkeys.values() if value.strip()]
     duplicates = sorted({value for value in normalized if normalized.count(value) > 1})
     return duplicates
+
+
+def _normalize_hotkey(value: str) -> str:
+    value = value.strip().lower()
+    if value.startswith("<") and value.endswith(">"):
+        value = value[1:-1]
+    return normalize_key_name(value)

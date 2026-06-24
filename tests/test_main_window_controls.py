@@ -43,6 +43,8 @@ def test_countdown_has_visible_main_window_feedback(tmp_path, qtbot):
     assert window.state == AppState.COUNTING_DOWN
     assert window.record_button.text() == "Cancel Countdown"
     assert window.stop_button.text() == "Cancel"
+    assert not window.countdown_banner.isHidden()
+    assert window.countdown_banner.text().startswith("Recording starts in")
     assert "Recording starts in" in window.status.currentMessage()
     window._cancel_countdown()
 
@@ -63,5 +65,5 @@ def test_record_command_uses_direct_recording_path(tmp_path, qtbot):
     assert len(calls) == 1
     options, countdown_seconds, hide_during_recording = calls[0]
     assert isinstance(options, RecordingOptions)
-    assert countdown_seconds == 0
+    assert countdown_seconds == 5
     assert hide_during_recording is False
