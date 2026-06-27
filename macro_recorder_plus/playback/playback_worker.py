@@ -8,7 +8,7 @@ from PySide6.QtCore import QObject, Signal, Slot
 from macro_recorder_plus.models.environment import RecordedEnvironment, current_environment
 from macro_recorder_plus.models.actions import ActionType, MacroAction
 from macro_recorder_plus.platform.windows_monitors import transform_point
-from macro_recorder_plus.platform.windows_input import ActionExecutor
+from macro_recorder_plus.platform.windows_input import ActionExecutor, find_image_match_for_action
 from macro_recorder_plus.playback.safety_controller import SafetyController
 from macro_recorder_plus.utilities.timing import scaled_delay
 
@@ -82,6 +82,11 @@ class PlaybackWorker(QObject):
                         executor.release_all()
                         self.finished.emit(False, "Playback stopped")
                         return
+                elif action.type == ActionType.IMAGE_CLICK:
+                    if not self._play_image_click(transformed_action, executor, mouse_controller):
+                        executor.release_all()
+                        self.finished.emit(False, "Playback stopped")
+                        return
                 else:
                     executor.execute(transformed_action)
                 self.progress.emit(index, action)
@@ -131,6 +136,22 @@ class PlaybackWorker(QObject):
             if not self._wait_until(start_time + (relative_time / self.speed), mouse_controller):
                 return False
             mouse_controller.position = (int(x), int(y))
+        return True
+
+    def _play_image_click(self, action: MacroAction, executor: ActionExecutor, mouse_controller: object) -> bool:
+        def stop_check() -> bool:
+            if self._paused:
+                return self._wait_while_paused_or_stopped(mouse_controller)
+            return self.safety.should_stop(getattr(mouse_controller, "position", None))
+
+        match = find_image_match_for_action(action, stop_check=stop_check)
+        if match is None:
+            if stop_check():
+                return False
+            if str(action.params.get("on_not_found", "error")) == "skip":
+                return True
+            raise ValueError(f"Image not found on screen: {action.params.get('image_path', '')}")
+        executor.click_image_match(action, match)
         return True
 
     def _wait_until(self, target: float, mouse_controller: object) -> bool:

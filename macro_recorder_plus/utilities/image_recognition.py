@@ -4,7 +4,7 @@ import ctypes
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,8 +26,11 @@ def find_image_on_screen(
     confidence: float = 0.85,
     timeout: float = 5.0,
     poll_interval: float = 0.25,
+    checks_per_second: float | None = None,
+    wait_until_found: bool = True,
     grayscale: bool = True,
     region: tuple[int, int, int, int] | None = None,
+    stop_check: Callable[[], bool] | None = None,
 ) -> ImageMatch | None:
     from PIL import Image, ImageGrab
 
@@ -36,8 +39,12 @@ def find_image_on_screen(
         raise FileNotFoundError(f"Image not found: {template_path}")
 
     template = Image.open(template_path)
-    deadline = time.perf_counter() + max(0.0, float(timeout))
+    timeout_seconds = max(0.0, float(timeout))
+    poll_seconds = poll_interval_from_frequency(poll_interval, checks_per_second)
+    deadline = None if wait_until_found and timeout_seconds <= 0 else time.perf_counter() + timeout_seconds
     while True:
+        if stop_check is not None and stop_check():
+            return None
         screenshot, offset_x, offset_y = _grab_screen(ImageGrab, region)
         match = locate_image_in_image(screenshot, template, confidence=confidence, grayscale=grayscale)
         if match is not None:
@@ -48,9 +55,19 @@ def find_image_on_screen(
                 height=match.height,
                 confidence=match.confidence,
             )
-        if time.perf_counter() >= deadline:
+        if not wait_until_found:
             return None
-        time.sleep(max(0.05, float(poll_interval)))
+        if deadline is not None and time.perf_counter() >= deadline:
+            return None
+        sleep_seconds = poll_seconds if deadline is None else min(poll_seconds, max(0.0, deadline - time.perf_counter()))
+        if not _sleep_with_stop_check(sleep_seconds, stop_check):
+            return None
+
+
+def poll_interval_from_frequency(poll_interval: float = 0.25, checks_per_second: float | None = None) -> float:
+    if checks_per_second is not None:
+        return max(0.01, 1.0 / max(0.1, float(checks_per_second)))
+    return max(0.05, float(poll_interval))
 
 
 def locate_image_in_image(
@@ -134,6 +151,17 @@ def _grab_screen(image_grab_module: Any, region: tuple[int, int, int, int] | Non
         return screenshot, *_virtual_screen_origin()
     except TypeError:
         return image_grab_module.grab(), 0, 0
+
+
+def _sleep_with_stop_check(seconds: float, stop_check: Callable[[], bool] | None) -> bool:
+    target = time.perf_counter() + max(0.0, seconds)
+    while True:
+        if stop_check is not None and stop_check():
+            return False
+        remaining = target - time.perf_counter()
+        if remaining <= 0:
+            return True
+        time.sleep(min(remaining, 0.05))
 
 
 def _virtual_screen_origin() -> tuple[int, int]:

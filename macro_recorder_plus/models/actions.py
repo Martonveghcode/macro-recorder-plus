@@ -9,6 +9,7 @@ from typing import Any
 class ActionType(str, Enum):
     WAIT = "wait"
     OPEN_URL = "open_url"
+    OPEN_FILE = "open_file"
     LAUNCH_PROGRAM = "launch_program"
     TYPE_TEXT = "type_text"
     TYPE_SECRET = "type_secret"
@@ -24,6 +25,7 @@ class ActionType(str, Enum):
 ACTION_LABELS = {
     ActionType.WAIT: "Wait",
     ActionType.OPEN_URL: "Open URL",
+    ActionType.OPEN_FILE: "Open File",
     ActionType.LAUNCH_PROGRAM: "Launch Program",
     ActionType.TYPE_TEXT: "Type Text",
     ActionType.TYPE_SECRET: "Type Secret",
@@ -40,10 +42,13 @@ ACTION_LABELS = {
 DEFAULT_PARAMS: dict[ActionType, dict[str, Any]] = {
     ActionType.WAIT: {"seconds": 1.0},
     ActionType.OPEN_URL: {"url": "https://example.com"},
+    ActionType.OPEN_FILE: {"file_path": "", "target_monitor": "default", "auto_focus": False},
     ActionType.LAUNCH_PROGRAM: {
         "executable": "",
         "arguments": "",
         "working_directory": "",
+        "target_monitor": "default",
+        "auto_focus": False,
         "wait_for_startup": False,
         "startup_timeout": 10.0,
     },
@@ -106,6 +111,9 @@ class MacroAction:
                 return f"Wait {self.params.get('seconds', self.duration or self.delay):.2f}s"
             case ActionType.OPEN_URL:
                 return str(self.params.get("url", ""))
+            case ActionType.OPEN_FILE:
+                file_path = self.params.get("file_path") or "file"
+                return f"Open {file_path}"
             case ActionType.LAUNCH_PROGRAM:
                 executable = self.params.get("executable") or "program"
                 return f"Launch {executable}"
@@ -137,6 +145,8 @@ class MacroAction:
         match self.type:
             case ActionType.OPEN_URL:
                 return str(self.params.get("url", ""))
+            case ActionType.OPEN_FILE:
+                return str(self.params.get("file_path", ""))
             case ActionType.LAUNCH_PROGRAM:
                 return str(self.params.get("executable", ""))
             case ActionType.TYPE_SECRET:

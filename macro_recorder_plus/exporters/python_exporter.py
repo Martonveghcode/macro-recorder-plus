@@ -66,6 +66,10 @@ def safe_batch_filename(script_path: Path) -> str:
 
 
 class PythonExporter:
+    def __init__(self, *, python_executable: str | Path | None = None) -> None:
+        configured = str(python_executable).strip() if python_executable else ""
+        self.python_executable = configured or str(Path(sys.executable))
+
     def render(self, document: MacroDocument) -> str:
         payload = json.dumps(document.to_dict(), separators=(",", ":"), sort_keys=True)
         template = '''\
@@ -195,6 +199,184 @@ def resolve_image_path(image_path):
     return SCRIPT_DIR / path
 
 
+def resolve_file_path(file_path):
+    value = os.path.expandvars(str(file_path)).strip().strip('"')
+    if not value:
+        raise RuntimeError("Open File action is missing a file path")
+    path = Path(value).expanduser()
+    if path.is_absolute():
+        return path
+    return SCRIPT_DIR / path
+
+
+def open_file_with_default_app(file_path, *, target_monitor="default", auto_focus=False, timeout=10.0):
+    path = resolve_file_path(file_path)
+    if not path.exists() or not path.is_file():
+        raise FileNotFoundError(f"File not found: {path}")
+    if sys.platform == "win32":
+        if auto_focus or target_monitor != "default":
+            pid = shell_execute_file_with_process_id(path)
+            if pid is not None:
+                arrange_process_window(pid, target_monitor=target_monitor, auto_focus=auto_focus, timeout=timeout)
+                return
+        os.startfile(str(path))
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", str(path)])
+    else:
+        subprocess.Popen(["xdg-open", str(path)])
+
+
+def shell_execute_file_with_process_id(path):
+    class SHELLEXECUTEINFOW(ctypes.Structure):
+        _fields_ = [
+            ("cbSize", ctypes.c_ulong),
+            ("fMask", ctypes.c_ulong),
+            ("hwnd", ctypes.c_void_p),
+            ("lpVerb", ctypes.c_wchar_p),
+            ("lpFile", ctypes.c_wchar_p),
+            ("lpParameters", ctypes.c_wchar_p),
+            ("lpDirectory", ctypes.c_wchar_p),
+            ("nShow", ctypes.c_int),
+            ("hInstApp", ctypes.c_void_p),
+            ("lpIDList", ctypes.c_void_p),
+            ("lpClass", ctypes.c_wchar_p),
+            ("hkeyClass", ctypes.c_void_p),
+            ("dwHotKey", ctypes.c_ulong),
+            ("hIcon", ctypes.c_void_p),
+            ("hProcess", ctypes.c_void_p),
+        ]
+
+    shell32 = ctypes.windll.shell32
+    kernel32 = ctypes.windll.kernel32
+    info = SHELLEXECUTEINFOW()
+    info.cbSize = ctypes.sizeof(SHELLEXECUTEINFOW)
+    info.fMask = 0x00000040
+    info.lpVerb = "open"
+    info.lpFile = str(path)
+    info.nShow = 1
+    if not shell32.ShellExecuteExW(ctypes.byref(info)) or not info.hProcess:
+        return None
+    try:
+        return int(kernel32.GetProcessId(info.hProcess))
+    finally:
+        kernel32.CloseHandle(info.hProcess)
+
+
+def arrange_process_window(process_id, *, target_monitor="default", auto_focus=False, timeout=10.0):
+    if sys.platform != "win32" or not process_id:
+        return False
+    hwnd = find_top_level_window_for_process(int(process_id), timeout=max(0.0, timeout))
+    if not hwnd:
+        return False
+    user32 = ctypes.windll.user32
+    user32.ShowWindow(hwnd, 9)
+    monitor = select_target_monitor(target_monitor)
+    if monitor is not None:
+        move_window_to_monitor(hwnd, monitor)
+    if auto_focus:
+        user32.BringWindowToTop(hwnd)
+        user32.SetForegroundWindow(hwnd)
+    return True
+
+
+def find_top_level_window_for_process(process_id, *, timeout):
+    user32 = ctypes.windll.user32
+    deadline = time.perf_counter() + timeout
+    enum_proc_type = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+
+    def find_once():
+        found = []
+
+        def callback(hwnd, lparam):
+            if not user32.IsWindowVisible(hwnd) or user32.GetWindow(hwnd, 4):
+                return True
+            window_pid = ctypes.c_ulong()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(window_pid))
+            if int(window_pid.value) == process_id:
+                found.append(int(hwnd))
+                return False
+            return True
+
+        user32.EnumWindows(enum_proc_type(callback), 0)
+        return found[0] if found else None
+
+    while True:
+        hwnd = find_once()
+        if hwnd is not None:
+            return hwnd
+        if time.perf_counter() >= deadline:
+            return None
+        time.sleep(0.05)
+
+
+def select_target_monitor(target_monitor):
+    value = str(target_monitor or "default").lower()
+    if value == "default" or sys.platform != "win32":
+        return None
+    monitors = windows_monitors()
+    if not monitors:
+        return None
+    if value == "primary":
+        return next((monitor for monitor in monitors if monitor["primary"]), monitors[0])
+    if value.isdigit():
+        index = int(value) - 1
+        if 0 <= index < len(monitors):
+            return monitors[index]
+    return None
+
+
+def windows_monitors():
+    user32 = ctypes.windll.user32
+
+    class RECT(ctypes.Structure):
+        _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long), ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+    class MONITORINFOEXW(ctypes.Structure):
+        _fields_ = [
+            ("cbSize", ctypes.c_ulong),
+            ("rcMonitor", RECT),
+            ("rcWork", RECT),
+            ("dwFlags", ctypes.c_ulong),
+            ("szDevice", ctypes.c_wchar * 32),
+        ]
+
+    monitors = []
+    enum_proc_type = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(RECT), ctypes.c_void_p)
+
+    def callback(hmonitor, hdc, rect, data):
+        info = MONITORINFOEXW()
+        info.cbSize = ctypes.sizeof(MONITORINFOEXW)
+        if user32.GetMonitorInfoW(hmonitor, ctypes.byref(info)):
+            monitors.append(
+                {
+                    "work": (info.rcWork.left, info.rcWork.top, info.rcWork.right, info.rcWork.bottom),
+                    "primary": bool(info.dwFlags & 1),
+                }
+            )
+        return 1
+
+    user32.EnumDisplayMonitors(0, 0, enum_proc_type(callback), 0)
+    return monitors
+
+
+def move_window_to_monitor(hwnd, monitor):
+    class RECT(ctypes.Structure):
+        _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long), ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+    user32 = ctypes.windll.user32
+    rect = RECT()
+    if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+        return
+    left, top, right, bottom = monitor["work"]
+    work_width = max(1, int(right - left))
+    work_height = max(1, int(bottom - top))
+    width = min(max(1, int(rect.right - rect.left)), work_width)
+    height = min(max(1, int(rect.bottom - rect.top)), work_height)
+    x = int(left) + max(0, (work_width - width) // 2)
+    y = int(top) + max(0, (work_height - height) // 2)
+    user32.SetWindowPos(hwnd, 0, x, y, width, height, 0x0004)
+
+
 def region_from_params(params):
     width = int(params.get("region_width", 0) or 0)
     height = int(params.get("region_height", 0) or 0)
@@ -208,7 +390,21 @@ def region_from_params(params):
     )
 
 
-def find_image_on_screen(params):
+def poll_interval_from_params(params):
+    checks_per_second = params.get("checks_per_second")
+    if checks_per_second is not None:
+        return max(0.01, 1.0 / max(0.1, float(checks_per_second)))
+    return max(0.05, float(params.get("poll_interval", 0.25)))
+
+
+def wait_until_found_from_params(params, timeout):
+    wait_until_found = bool(params.get("wait_until_found", True))
+    if "wait_until_found" not in params and timeout <= 0:
+        return False
+    return wait_until_found
+
+
+def find_image_on_screen(params, stop_event=None):
     from PIL import Image, ImageGrab
     import numpy as np
 
@@ -219,12 +415,15 @@ def find_image_on_screen(params):
     template = Image.open(image_path)
     confidence = min(1.0, max(0.0, float(params.get("confidence", 0.85))))
     timeout = max(0.0, float(params.get("timeout", 5.0)))
-    poll_interval = max(0.05, float(params.get("poll_interval", 0.25)))
+    poll_interval = poll_interval_from_params(params)
+    wait_until_found = wait_until_found_from_params(params, timeout)
     grayscale = bool(params.get("grayscale", True))
     region = region_from_params(params)
-    deadline = time.perf_counter() + timeout
+    deadline = None if wait_until_found and timeout <= 0 else time.perf_counter() + timeout
 
     while True:
+        if stop_event is not None and stop_event.is_set():
+            return None
         screenshot, offset_x, offset_y = grab_screen(ImageGrab, region)
         match = locate_image_in_image(screenshot, template, np, confidence=confidence, grayscale=grayscale)
         if match is not None:
@@ -237,9 +436,16 @@ def find_image_on_screen(params):
                 "confidence": score,
                 "center": (x + offset_x + width // 2, y + offset_y + height // 2),
             }
-        if time.perf_counter() >= deadline:
+        if not wait_until_found:
             return None
-        time.sleep(poll_interval)
+        if deadline is not None and time.perf_counter() >= deadline:
+            return None
+        sleep_seconds = poll_interval if deadline is None else min(poll_interval, max(0.0, deadline - time.perf_counter()))
+        if stop_event is not None:
+            if not sleep_until(time.perf_counter() + sleep_seconds, stop_event):
+                return None
+        else:
+            time.sleep(sleep_seconds)
 
 
 def grab_screen(image_grab_module, region):
@@ -346,29 +552,32 @@ def best_sampled_candidates(screen_array, template_array, candidate_rows, candid
     return candidate_rows[best_indexes], candidate_cols[best_indexes]
 
 
-def execute_image_click(params, mouse_controller, mouse):
-    match = find_image_on_screen(params)
+def execute_image_click(params, mouse_controller, mouse, stop_event=None):
+    match = find_image_on_screen(params, stop_event=stop_event)
     if match is None:
+        if stop_event is not None and stop_event.is_set():
+            return False
         if params.get("on_not_found", "error") == "skip":
             print(f"Image not found, skipping: {params.get('image_path', '')}", file=sys.stderr)
-            return
+            return True
         raise RuntimeError(f"Image not found on screen: {params.get('image_path', '')}")
 
     mouse_controller.position = match["center"]
     click_action = str(params.get("click_action", "left_click"))
     if click_action == "move_only":
-        return
+        return True
     if click_action == "double_click":
         button = button_from_name("left", mouse)
         for _ in range(2):
             mouse_controller.press(button)
             mouse_controller.release(button)
             time.sleep(0.05)
-        return
+        return True
 
     button = button_from_name(click_action.replace("_click", ""), mouse)
     mouse_controller.press(button)
     mouse_controller.release(button)
+    return True
 
 
 def interpolated_mouse_points(points, hz=60):
@@ -477,11 +686,27 @@ def main():
                     return 130
             elif action_type == "open_url":
                 webbrowser.open(params["url"])
+            elif action_type == "open_file":
+                open_file_with_default_app(
+                    params.get("file_path", ""),
+                    target_monitor=params.get("target_monitor", "default"),
+                    auto_focus=bool(params.get("auto_focus", False)),
+                )
             elif action_type == "launch_program":
                 command = [params["executable"]]
                 if params.get("arguments"):
                     command.append(params["arguments"])
-                subprocess.Popen(command, cwd=params.get("working_directory") or None)
+                process = subprocess.Popen(command, cwd=params.get("working_directory") or None)
+                target_monitor = params.get("target_monitor", "default")
+                auto_focus = bool(params.get("auto_focus", False))
+                wait_for_startup = bool(params.get("wait_for_startup", False))
+                if wait_for_startup or auto_focus or target_monitor != "default":
+                    arrange_process_window(
+                        process.pid,
+                        target_monitor=target_monitor,
+                        auto_focus=auto_focus,
+                        timeout=float(params.get("startup_timeout", 10.0)),
+                    )
             elif action_type == "type_text":
                 keyboard_controller.type(params.get("text", ""))
             elif action_type == "type_secret":
@@ -536,7 +761,9 @@ def main():
                 mouse_controller.position = (int(params.get("x", 0)), int(params.get("y", 0)))
                 mouse_controller.scroll(int(params.get("dx", 0)), int(params.get("dy", 0)))
             elif action_type == "image_click":
-                execute_image_click(params, mouse_controller, mouse)
+                if not execute_image_click(params, mouse_controller, mouse, stop_event):
+                    print("Emergency stop requested", file=sys.stderr)
+                    return 130
         return 0
     except KeyboardInterrupt:
         print("Interrupted", file=sys.stderr)
@@ -616,7 +843,7 @@ if __name__ == "__main__":
         readme.write_text(self._readme_text(), encoding="utf-8")
 
     def _install_batch(self) -> str:
-        python_exe = str(Path(sys.executable))
+        python_exe = str(Path(self.python_executable))
         return (
             "@echo off\n"
             "setlocal\n"
@@ -634,7 +861,7 @@ if __name__ == "__main__":
         )
 
     def _run_batch(self, target: Path) -> str:
-        python_exe = str(Path(sys.executable))
+        python_exe = str(Path(self.python_executable))
         dependency_checks = "\n".join(f'if not exist "%DEPS_DIR%\\{name}" set "NEED_INSTALL=1"' for name in RUNTIME_IMPORT_DIRS)
         return (
             "@echo off\n"
@@ -667,6 +894,10 @@ if __name__ == "__main__":
               python your_macro.py --dry-run
               python your_macro.py --speed 1.5
               python your_macro.py --start-action 12
+
+            Secret actions read from environment variables in this process. For example:
+              set WEBSITE_PASSWORD=secret
+              python your_macro.py
 
             Press F10 while a macro is running to request an emergency stop.
             '''

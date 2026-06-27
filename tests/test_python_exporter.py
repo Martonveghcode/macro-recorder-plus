@@ -49,6 +49,28 @@ def test_python_export_is_valid_and_dry_run_does_not_need_pynput(tmp_path):
     assert "0: comment" in result.stdout
 
 
+def test_python_export_supports_open_file_dry_run(tmp_path):
+    document = MacroDocument(
+        name="export",
+        actions=[MacroAction(type=ActionType.OPEN_FILE, params={"file_path": "notes.pdf"})],
+    )
+
+    path = PythonExporter().export(document, tmp_path / "exported.py")
+    text = path.read_text(encoding="utf-8")
+
+    py_compile.compile(str(path), doraise=True)
+    result = subprocess.run(
+        [sys.executable, str(path), "--dry-run"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert "open_file_with_default_app" in text
+    assert result.returncode == 0
+    assert "0: open_file" in result.stdout
+
+
 def test_python_export_writes_dependency_support_files(tmp_path):
     document = MacroDocument(name="export")
 
@@ -62,6 +84,17 @@ def test_python_export_writes_dependency_support_files(tmp_path):
     assert (runtime_dir / "install_dependencies.bat").exists()
     assert (path.parent / "run_exported.bat").exists()
     assert (path.parent / "README_exported_macros.txt").exists()
+    assert "Secret actions read from environment variables" in (path.parent / "README_exported_macros.txt").read_text(encoding="utf-8")
+
+
+def test_python_export_uses_configured_python_in_batch_files(tmp_path):
+    document = MacroDocument(name="export")
+    python_executable = r"C:\Tools\Python312\python.exe"
+
+    path = PythonExporter(python_executable=python_executable).export(document, tmp_path / "exported.py")
+
+    assert python_executable in (path.parent / "run_exported.bat").read_text(encoding="utf-8")
+    assert python_executable in (path.parent / RUNTIME_DIR_NAME / "install_dependencies.bat").read_text(encoding="utf-8")
 
 
 def test_python_export_copies_image_click_assets(tmp_path):

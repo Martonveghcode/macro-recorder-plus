@@ -13,6 +13,7 @@ dependencies = [
     "pynput>=1.7.7",
     "Pillow>=10",
     "numpy>=1.26",
+    "pyqtdarktheme-fork>=2.3.6",
 ]
 
 [project.optional-dependencies]

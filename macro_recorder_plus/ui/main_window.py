@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import importlib.util
 import logging
-import subprocess
+import sys
 from pathlib import Path
 
 from PySide6.QtCore import QSettings, Qt, QTimer, QUrl, Slot
 from PySide6.QtGui import QAction, QCloseEvent, QDesktopServices, QIcon, QKeySequence, QUndoStack
 from PySide6.QtWidgets import (
     QFileDialog,
+    QApplication,
+    QDialog,
     QHBoxLayout,
     QLabel,
     QMainWindow,
@@ -27,7 +29,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from macro_recorder_plus.exporters.pyinstaller_exporter import PyInstallerExporter
+from macro_recorder_plus.exporters.pyinstaller_exporter import PyInstallerExporter, split_pyinstaller_options
 from macro_recorder_plus.exporters.python_exporter import PythonExporter, default_export_directory, safe_script_filename
 from macro_recorder_plus.models.actions import ACTION_LABELS, ActionType, MacroAction, create_action
 from macro_recorder_plus.models.environment import current_environment
@@ -45,6 +47,7 @@ from macro_recorder_plus.ui.monitor_warning_dialog import MonitorWarningDialog
 from macro_recorder_plus.ui.recording_dialog import RecordingDialog
 from macro_recorder_plus.ui.settings_dialog import SettingsDialog
 from macro_recorder_plus.ui.state import AppState
+from macro_recorder_plus.ui.theme import apply_theme
 from macro_recorder_plus.utilities.sound import play_notification
 
 
@@ -64,6 +67,10 @@ class MainWindow(QMainWindow):
         self.undo_stack = QUndoStack(self)
         self.model = ActionTableModel(self.document.actions, self)
         self.model.dirtyChanged.connect(self._on_dirty_changed)
+        self.model.modelReset.connect(self._refresh_controls)
+        self.model.rowsInserted.connect(self._refresh_controls)
+        self.model.rowsRemoved.connect(self._refresh_controls)
+        self.model.layoutChanged.connect(self._refresh_controls)
         self.recorder = InputRecorder(self)
         self.recorder.actionRecorded.connect(self._append_recorded_action, Qt.ConnectionType.QueuedConnection)
         self.recorder.started.connect(self._recording_started)
@@ -360,7 +367,7 @@ class MainWindow(QMainWindow):
         if not self._maybe_save():
             return
         dialog = RecordingDialog(self)
-        if dialog.exec() != dialog.Accepted:
+        if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         self._start_new_recording(
             options=dialog.options(),
@@ -498,7 +505,7 @@ class MainWindow(QMainWindow):
         current = current_environment()
         if self.document.recorded_environment.monitors and len(self.document.recorded_environment.monitors) != len(current.monitors):
             dialog = MonitorWarningDialog(self.document.recorded_environment, current, self)
-            if dialog.exec() != dialog.Accepted:
+            if dialog.exec() != QDialog.DialogCode.Accepted:
                 return
             self.document.settings["coordinate_mode"] = dialog.coordinate_mode
         countdown_seconds = int(self.settings.value("playback/countdown", 0))
@@ -645,21 +652,27 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getSaveFileName(self, "Export Python Script", str(default_path), "Python scripts (*.py)")
         if not path:
             return
-        target = PythonExporter().export(self.document, path)
+        target = PythonExporter(python_executable=self._configured_python_executable()).export(self.document, path)
         self.settings.setValue("export/directory", str(target.parent))
         self.settings.sync()
         self.status.showMessage(f"Exported {target.name} with runtime files")
 
     def export_exe(self) -> None:
-        if importlib.util.find_spec("PyInstaller") is None:
+        python_executable = self._configured_python_executable()
+        pyinstaller_executable = self._setting_text("export/pyinstaller") or None
+        using_current_python = python_executable == sys.executable
+        if pyinstaller_executable is None and using_current_python and importlib.util.find_spec("PyInstaller") is None:
             QMessageBox.warning(self, "PyInstaller unavailable", "Install PyInstaller to export a Windows .exe.")
             return
         self._sync_document()
-        output_dir = QFileDialog.getExistingDirectory(self, "Choose EXE output folder")
+        default_dir = Path(self._setting_text("export/directory") or default_export_directory())
+        output_dir = QFileDialog.getExistingDirectory(self, "Choose EXE output folder", str(default_dir))
         if not output_dir:
             return
+        self.settings.setValue("export/directory", output_dir)
+        self.settings.sync()
         script_path = Path(output_dir) / safe_script_filename(self.document.name)
-        PythonExporter().export(self.document, script_path)
+        PythonExporter(python_executable=python_executable).export(self.document, script_path)
         dialog = ExportDialog(self)
         self.export_process = PyInstallerExporter(self)
         self.export_process.output.connect(dialog.append_output)
@@ -668,7 +681,14 @@ class MainWindow(QMainWindow):
         self.export_progress.setWindowTitle("Export Windows EXE")
         self.export_progress.canceled.connect(lambda: self.export_process.process.kill() if self.export_process and self.export_process.process else None)
         self._set_state(AppState.EXPORTING)
-        self.export_process.build(script_path, output_dir, name=script_path.stem)
+        self.export_process.build(
+            script_path,
+            output_dir,
+            name=script_path.stem,
+            python_executable=python_executable,
+            pyinstaller_executable=pyinstaller_executable,
+            extra_args=split_pyinstaller_options(self._setting_text("export/options")),
+        )
         dialog.show()
         self.export_progress.show()
 
@@ -681,12 +701,32 @@ class MainWindow(QMainWindow):
 
     def open_settings(self) -> None:
         dialog = SettingsDialog(self.settings, self)
-        if dialog.exec() == dialog.Accepted:
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            theme_error = apply_theme(self.settings)
+            if theme_error:
+                self.status.showMessage(theme_error)
+            else:
+                self._refresh_themed_widgets()
             self._restart_hotkeys()
 
     def _restart_hotkeys(self) -> None:
         hotkeys = {name: str(self.settings.value(f"hotkeys/{name}", default)) for name, default in DEFAULT_HOTKEYS.items()}
         self.hotkeys.start(hotkeys)
+
+    def _setting_text(self, key: str, default: str = "") -> str:
+        return str(self.settings.value(key, default) or "").strip()
+
+    def _configured_python_executable(self) -> str:
+        return self._setting_text("export/python") or sys.executable
+
+    def _refresh_themed_widgets(self) -> None:
+        app = QApplication.instance()
+        if app is None:
+            return
+        for widget in app.allWidgets():
+            widget.style().unpolish(widget)
+            widget.style().polish(widget)
+            widget.update()
 
     def _maybe_save(self) -> bool:
         if not self.model.dirty:
@@ -721,9 +761,11 @@ class MainWindow(QMainWindow):
         self.state = state
         self.state_label.setText(state.value)
         self.status.showMessage(state.value)
-        is_idle = state == AppState.IDLE
-        is_recording = state in {AppState.RECORDING, AppState.RECORDING_PAUSED}
-        is_playing = state in {AppState.PLAYING, AppState.PLAYBACK_PAUSED}
+        self._refresh_controls()
+
+    def _refresh_controls(self, *args) -> None:
+        is_idle = self.state == AppState.IDLE
+        is_recording = self.state in {AppState.RECORDING, AppState.RECORDING_PAUSED}
         self.act_new.setEnabled(True)
         self.act_open.setEnabled(is_idle)
         self.act_save.setEnabled(is_idle)
@@ -731,14 +773,14 @@ class MainWindow(QMainWindow):
         self.act_run_selected.setEnabled(is_idle and bool(self.model.actions))
         self.act_pause_active.setEnabled(True)
         self.act_stop_active.setEnabled(True)
-        self.act_pause_active.setText("Resume" if state in {AppState.RECORDING_PAUSED, AppState.PLAYBACK_PAUSED} else "Pause")
-        if state == AppState.COUNTING_DOWN:
+        self.act_pause_active.setText("Resume" if self.state in {AppState.RECORDING_PAUSED, AppState.PLAYBACK_PAUSED} else "Pause")
+        if self.state == AppState.COUNTING_DOWN:
             self.record_button.setText("Cancel Countdown")
         else:
             self.record_button.setText("Stop Recording" if is_recording else "Record")
         self.run_button.setEnabled(True)
-        self.pause_button.setText("Resume" if state in {AppState.RECORDING_PAUSED, AppState.PLAYBACK_PAUSED} else "Pause")
-        self.stop_button.setText("Cancel" if state == AppState.COUNTING_DOWN else "Stop")
+        self.pause_button.setText("Resume" if self.state in {AppState.RECORDING_PAUSED, AppState.PLAYBACK_PAUSED} else "Pause")
+        self.stop_button.setText("Cancel" if self.state == AppState.COUNTING_DOWN else "Stop")
         self.stop_button.setEnabled(True)
         self.act_export_py.setEnabled(is_idle and bool(self.model.actions))
         self.act_export_exe.setEnabled(is_idle and bool(self.model.actions))
