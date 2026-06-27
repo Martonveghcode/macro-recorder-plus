@@ -1,10 +1,8 @@
 # Macro Recorder +
 
-[![CI](https://github.com/Martonveghcode/macro-recorder-plus/actions/workflows/ci.yml/badge.svg)](https://github.com/Martonveghcode/macro-recorder-plus/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)
 ![Platform](https://img.shields.io/badge/platform-Windows-0078D4?logo=windows&logoColor=white)
 ![UI](https://img.shields.io/badge/UI-PySide6-41CD52?logo=qt&logoColor=white)
-![Tests](https://img.shields.io/badge/tests-pytest-0A9EDC?logo=pytest&logoColor=white)
 
 Macro Recorder + is a Windows-focused desktop macro recorder and player built with Python, PySide6, Qt Widgets, and pynput. It records global keyboard and mouse activity, normalizes recordings into editable actions, saves a documented JSON macro file, exports standalone Python playback scripts, and can hand those scripts to PyInstaller for optional `.exe` builds.
 
@@ -83,52 +81,11 @@ python exported_macro.py
 
 If the variable is missing, GUI playback errors. Exported scripts prompt only when they are running in an interactive terminal.
 
-## Test
-
-```powershell
-pytest
-python -m compileall macro_recorder_plus tests
-```
-
-For headless Qt test runs:
-
-```powershell
-$env:QT_QPA_PLATFORM = "offscreen"
-pytest
-```
-
-## Repository Structure
-
-```text
-macro_recorder_plus/
-  application.py
-  app.py
-  exporters/
-  models/
-  platform/
-  playback/
-  recorder/
-  storage/
-  ui/
-  utilities/
-docs/
-examples/
-packaging/
-tests/
-```
-
 ## Documentation
 
 - [JSON macro schema](docs/json-schema.md)
 - [Manual Windows test checklist](docs/manual-windows-test-checklist.md)
 - [Contributing guide](CONTRIBUTING.md)
-
-## Known Limitations
-
-- The implementation records keyboard press/release events and mouse movement groups, but deeper semantic recognition of every possible shortcut is intentionally conservative.
-- Display-layout transformation support includes exact/scaled coordinate modes and clamping helpers; complex per-monitor remapping should be manually checked before running destructive macros.
-- PyInstaller packaging must be validated on the final target Windows machine because Qt plugin discovery can vary by Python environment.
-- Secret actions read from the process environment or an interactive prompt in exported scripts; secrets are not stored in macro files.
 
 ## License
 
