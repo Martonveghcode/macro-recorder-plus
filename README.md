@@ -4,9 +4,7 @@
 ![Platform](https://img.shields.io/badge/platform-Windows-0078D4?logo=windows&logoColor=white)
 ![UI](https://img.shields.io/badge/UI-PySide6-41CD52?logo=qt&logoColor=white)
 
-The macro recorder that actually works.
-
-Macro Recorder + is a Windows-focused desktop macro recorder and player built with Python, PySide6, Qt Widgets, and pynput. It records global keyboard and mouse activity, normalizes recordings into editable actions, saves a documented JSON macro file, exports standalone Python playback scripts, and can hand those scripts to PyInstaller for optional `.exe` builds.
+The macro recorder that actually works. Windows desktop app built with Python and PySide6 for recording, editing, replaying, and exporting keyboard and mouse workflows. Exports to `.py` and `.exe` to make your macros run effortlessly. Fully open source and free.
 
 ![Macro Recorder + main window](docs/screenshot.png)
 
