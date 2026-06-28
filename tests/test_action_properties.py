@@ -45,6 +45,25 @@ def test_action_properties_emits_image_wait_frequency_params(qtbot):
     assert updated.params["poll_interval"] == 0.125
 
 
+def test_action_properties_emits_if_image_result_params(qtbot):
+    widget = ActionProperties()
+    qtbot.addWidget(widget)
+    action = create_action(ActionType.IF_CONDITION)
+    widget.set_action(0, action)
+
+    widget.param_widgets["image_found_action"].setValue(5)
+    widget.param_widgets["image_not_found_action"].setValue(0)
+
+    with qtbot.waitSignal(widget.actionChanged, timeout=1000) as blocker:
+        widget.apply_button.click()
+
+    row, updated = blocker.args
+    assert row == 0
+    assert updated.type == ActionType.IF_CONDITION
+    assert updated.params["image_found_action"] == 5
+    assert updated.params["image_not_found_action"] == 0
+
+
 def test_action_properties_emits_open_file_params(qtbot):
     widget = ActionProperties()
     qtbot.addWidget(widget)

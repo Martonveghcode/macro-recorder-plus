@@ -42,6 +42,7 @@ class PlaybackWorker(QObject):
         self.current_environment = current_environment_snapshot or current_environment()
         self.coordinate_mode = coordinate_mode
         self._paused = False
+        self._last_image_found: bool | None = None
 
     @Slot()
     def run(self) -> None:
@@ -59,12 +60,18 @@ class PlaybackWorker(QObject):
                     mode=self.coordinate_mode,
                 )
             executor = ActionExecutor(keyboard.Controller(), mouse_controller)
-            for index, action in enumerate(self.actions[self.start_index :], start=self.start_index):
+            index = min(self.start_index, len(self.actions))
+            while index < len(self.actions):
+                action = self.actions[index]
+                next_index = index + 1
                 if self._wait_while_paused_or_stopped(mouse_controller):
                     executor.release_all()
                     self.finished.emit(False, "Playback stopped")
                     return
                 if not action.enabled:
+                    if action.type == ActionType.IMAGE_CLICK:
+                        self._last_image_found = None
+                    index = next_index
                     continue
                 if not self._wait_seconds(scaled_delay(action.delay, self.speed), mouse_controller):
                     executor.release_all()
@@ -83,13 +90,21 @@ class PlaybackWorker(QObject):
                         self.finished.emit(False, "Playback stopped")
                         return
                 elif action.type == ActionType.IMAGE_CLICK:
-                    if not self._play_image_click(transformed_action, executor, mouse_controller):
+                    image_found = self._play_image_click(transformed_action, executor, mouse_controller)
+                    if image_found is None:
                         executor.release_all()
                         self.finished.emit(False, "Playback stopped")
                         return
+                    self._last_image_found = image_found
+                elif action.type == ActionType.IF_CONDITION:
+                    jump_index = self._conditional_jump_index(action)
+                    if jump_index is not None:
+                        self.status.emit(f"If Image Result jumped to action {jump_index + 1}")
+                        next_index = jump_index
                 else:
                     executor.execute(transformed_action)
                 self.progress.emit(index, action)
+                index = next_index
             executor.release_all()
             self.finished.emit(True, "Playback complete")
         except Exception as exc:
@@ -138,7 +153,7 @@ class PlaybackWorker(QObject):
             mouse_controller.position = (int(x), int(y))
         return True
 
-    def _play_image_click(self, action: MacroAction, executor: ActionExecutor, mouse_controller: object) -> bool:
+    def _play_image_click(self, action: MacroAction, executor: ActionExecutor, mouse_controller: object) -> bool | None:
         def stop_check() -> bool:
             if self._paused:
                 return self._wait_while_paused_or_stopped(mouse_controller)
@@ -147,12 +162,27 @@ class PlaybackWorker(QObject):
         match = find_image_match_for_action(action, stop_check=stop_check)
         if match is None:
             if stop_check():
-                return False
+                return None
             if str(action.params.get("on_not_found", "error")) == "skip":
-                return True
+                return False
             raise ValueError(f"Image not found on screen: {action.params.get('image_path', '')}")
         executor.click_image_match(action, match)
         return True
+
+    def _conditional_jump_index(self, action: MacroAction) -> int | None:
+        if self._last_image_found is None:
+            return None
+        target_key = "image_found_action" if self._last_image_found else "image_not_found_action"
+        try:
+            action_number = int(action.params.get(target_key, 0) or 0)
+        except (TypeError, ValueError):
+            action_number = 0
+        if action_number <= 0:
+            return None
+        target_index = action_number - 1
+        if not 0 <= target_index < len(self.actions):
+            raise ValueError(f"If Image Result target is outside the macro: action {action_number}")
+        return target_index
 
     def _wait_until(self, target: float, mouse_controller: object) -> bool:
         while True:
