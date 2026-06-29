@@ -25,7 +25,7 @@ Macro files are UTF-8 JSON documents. The default extension is `.mrplus.json`.
 Each action contains:
 
 - `id`: stable action identifier.
-- `type`: one of `wait`, `open_url`, `open_file`, `launch_program`, `type_text`, `type_secret`, `key_press`, `hotkey`, `mouse_move`, `mouse_button`, `scroll`, `image_click`, or `comment`.
+- `type`: one of `wait`, `open_url`, `open_file`, `launch_program`, `type_text`, `type_secret`, `key_press`, `hotkey`, `mouse_move`, `mouse_button`, `scroll`, `image_click`, `if_condition`, or `comment`.
 - `enabled`: whether playback should execute the action.
 - `delay`: seconds to wait after the previous action.
 - `timestamp`: relative timestamp from recording start.
@@ -109,3 +109,17 @@ Image click actions store the path to a screenshot or image template plus detect
 When exported as Python, referenced image files are copied into `macro_recorder_plus_assets` and the exported script uses the copied relative path.
 
 `checks_per_second` controls how often the screen is checked while `wait_until_found` is enabled. A `timeout` of `0` means keep waiting until the image appears or playback is stopped. `poll_interval` is still read for older macro files.
+
+Conditional image-result actions branch from the previous image click result:
+
+```json
+{
+  "type": "if_condition",
+  "params": {
+    "image_found_action": 5,
+    "image_not_found_action": 0
+  }
+}
+```
+
+Action numbers are 1-based table row numbers. `0` means continue normally to the next action. For the not-found branch to run, the previous `image_click` action must use `"on_not_found": "skip"`; otherwise playback stops with an image-not-found error before reaching the conditional action.

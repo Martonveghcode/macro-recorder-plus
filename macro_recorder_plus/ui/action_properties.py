@@ -72,6 +72,14 @@ FIELD_HELP: dict[str, tuple[str, str]] = {
     "image_click.region_y": ("Limits image searching to a region starting at this vertical coordinate.", "0 starts at the top edge."),
     "image_click.region_width": ("Limits image searching to this region width.", "800 searches an 800-pixel-wide area."),
     "image_click.region_height": ("Limits image searching to this region height.", "600 searches a 600-pixel-tall area."),
+    "if_condition.image_found_action": (
+        "Jumps to this 1-based action number when the previous image action found its image. Use 0 to continue normally.",
+        "5 jumps to action 5.",
+    ),
+    "if_condition.image_not_found_action": (
+        "Jumps to this 1-based action number when the previous image action did not find its image and was skipped. Use 0 to continue normally.",
+        "0 continues to the next action.",
+    ),
     "comment.text": ("Stores a note for humans and does nothing during playback.", "Remember to log in first."),
 }
 
@@ -264,6 +272,23 @@ class ActionProperties(QWidget):
                 self._add_int("region_y", "Region Y", int(params.get("region_y", 0)), -100000, 100000, "image_click.region_y")
                 self._add_int("region_width", "Region width", int(params.get("region_width", 0)), 0, 100000, "image_click.region_width")
                 self._add_int("region_height", "Region height", int(params.get("region_height", 0)), 0, 100000, "image_click.region_height")
+            case ActionType.IF_CONDITION:
+                self._add_int(
+                    "image_found_action",
+                    "If found go to",
+                    int(params.get("image_found_action", 0)),
+                    0,
+                    100000,
+                    "if_condition.image_found_action",
+                )
+                self._add_int(
+                    "image_not_found_action",
+                    "If not found go to",
+                    int(params.get("image_not_found_action", 0)),
+                    0,
+                    100000,
+                    "if_condition.image_not_found_action",
+                )
             case ActionType.COMMENT:
                 self._add_plain("text", "Text", str(params.get("text", "")), "comment.text")
 
@@ -320,6 +345,9 @@ class ActionProperties(QWidget):
                 params["on_not_found"] = self.param_widgets["on_not_found"].currentText()
                 for key in ["region_x", "region_y", "region_width", "region_height"]:
                     params[key] = self.param_widgets[key].value()
+            case ActionType.IF_CONDITION:
+                params["image_found_action"] = self.param_widgets["image_found_action"].value()
+                params["image_not_found_action"] = self.param_widgets["image_not_found_action"].value()
             case ActionType.COMMENT:
                 params["text"] = self.param_widgets["text"].toPlainText()
         return params

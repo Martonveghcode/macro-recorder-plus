@@ -71,6 +71,30 @@ def test_python_export_supports_open_file_dry_run(tmp_path):
     assert "0: open_file" in result.stdout
 
 
+def test_python_export_supports_if_image_result_dry_run(tmp_path):
+    document = MacroDocument(
+        name="export",
+        actions=[
+            MacroAction(type=ActionType.IF_CONDITION, params={"image_found_action": 1, "image_not_found_action": 0}),
+        ],
+    )
+
+    path = PythonExporter().export(document, tmp_path / "exported.py")
+    text = path.read_text(encoding="utf-8")
+
+    py_compile.compile(str(path), doraise=True)
+    result = subprocess.run(
+        [sys.executable, str(path), "--dry-run"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert "conditional_jump_target" in text
+    assert result.returncode == 0
+    assert "0: if_condition" in result.stdout
+
+
 def test_python_export_writes_dependency_support_files(tmp_path):
     document = MacroDocument(name="export")
 

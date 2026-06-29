@@ -19,6 +19,7 @@ class ActionType(str, Enum):
     MOUSE_BUTTON = "mouse_button"
     SCROLL = "scroll"
     IMAGE_CLICK = "image_click"
+    IF_CONDITION = "if_condition"
     COMMENT = "comment"
 
 
@@ -35,6 +36,7 @@ ACTION_LABELS = {
     ActionType.MOUSE_BUTTON: "Mouse Button",
     ActionType.SCROLL: "Scroll",
     ActionType.IMAGE_CLICK: "Find Image and Click",
+    ActionType.IF_CONDITION: "If Image Result",
     ActionType.COMMENT: "Comment",
 }
 
@@ -77,8 +79,22 @@ DEFAULT_PARAMS: dict[ActionType, dict[str, Any]] = {
         "region_width": 0,
         "region_height": 0,
     },
+    ActionType.IF_CONDITION: {
+        "image_found_action": 0,
+        "image_not_found_action": 0,
+    },
     ActionType.COMMENT: {"text": ""},
 }
+
+
+def _format_action_target(value: Any) -> str:
+    try:
+        action_number = int(value)
+    except (TypeError, ValueError):
+        action_number = 0
+    if action_number <= 0:
+        return "continue"
+    return f"action {action_number}"
 
 
 @dataclass(slots=True)
@@ -136,6 +152,10 @@ class MacroAction:
                 action = str(self.params.get("click_action", "left_click")).replace("_", " ")
                 image_path = str(self.params.get("image_path", ""))
                 return f"Find image and {action}: {image_path}"
+            case ActionType.IF_CONDITION:
+                found = _format_action_target(self.params.get("image_found_action", 0))
+                not_found = _format_action_target(self.params.get("image_not_found_action", 0))
+                return f"If last image found -> {found}; not found -> {not_found}"
             case ActionType.COMMENT:
                 return str(self.params.get("text", ""))
         return ACTION_LABELS[self.type]
@@ -161,6 +181,10 @@ class MacroAction:
                 return f"{self.params.get('x', '')}, {self.params.get('y', '')}"
             case ActionType.IMAGE_CLICK:
                 return str(self.params.get("image_path", ""))
+            case ActionType.IF_CONDITION:
+                found = _format_action_target(self.params.get("image_found_action", 0))
+                not_found = _format_action_target(self.params.get("image_not_found_action", 0))
+                return f"found: {found}; not found: {not_found}"
         return ""
 
     def clone(self, *, keep_id: bool = False) -> "MacroAction":

@@ -126,7 +126,7 @@ class ActionExecutor:
             return
 
         match action.type:
-            case ActionType.WAIT | ActionType.COMMENT:
+            case ActionType.WAIT | ActionType.IF_CONDITION | ActionType.COMMENT:
                 return
             case ActionType.OPEN_URL:
                 url = str(action.params.get("url", ""))

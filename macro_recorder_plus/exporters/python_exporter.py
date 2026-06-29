@@ -556,10 +556,10 @@ def execute_image_click(params, mouse_controller, mouse, stop_event=None):
     match = find_image_on_screen(params, stop_event=stop_event)
     if match is None:
         if stop_event is not None and stop_event.is_set():
-            return False
+            return None
         if params.get("on_not_found", "error") == "skip":
             print(f"Image not found, skipping: {params.get('image_path', '')}", file=sys.stderr)
-            return True
+            return False
         raise RuntimeError(f"Image not found on screen: {params.get('image_path', '')}")
 
     mouse_controller.position = match["center"]
@@ -578,6 +578,23 @@ def execute_image_click(params, mouse_controller, mouse, stop_event=None):
     mouse_controller.press(button)
     mouse_controller.release(button)
     return True
+
+
+def conditional_jump_target(params, runtime_state, action_count):
+    last_image_found = runtime_state.get("last_image_found")
+    if last_image_found is None:
+        return None
+    target_key = "image_found_action" if last_image_found else "image_not_found_action"
+    try:
+        action_number = int(params.get(target_key, 0) or 0)
+    except (TypeError, ValueError):
+        action_number = 0
+    if action_number <= 0:
+        return None
+    target_index = action_number - 1
+    if not 0 <= target_index < action_count:
+        raise RuntimeError(f"If Image Result target is outside the macro: action {action_number}")
+    return target_index
 
 
 def interpolated_mouse_points(points, hz=60):
@@ -662,11 +679,19 @@ def main():
         held_buttons.clear()
 
     try:
-        for index, action in enumerate(MACRO["actions"][args.start_action:], start=args.start_action):
+        actions = MACRO["actions"]
+        runtime_state = {"last_image_found": None}
+        index = max(0, args.start_action)
+        while index < len(actions):
+            action = actions[index]
+            next_index = index + 1
             if stop_event.is_set():
                 print("Emergency stop requested", file=sys.stderr)
                 return 130
             if not action.get("enabled", True):
+                if action.get("type") == "image_click":
+                    runtime_state["last_image_found"] = None
+                index = next_index
                 continue
             delay = max(0.0, float(action.get("delay", 0.0))) / speed
             if delay and not args.dry_run:
@@ -675,6 +700,7 @@ def main():
                     return 130
             print(f"{index}: {action['type']} {action.get('label') or action.get('params', '')}")
             if args.dry_run:
+                index = next_index
                 continue
 
             params = action.get("params", {})
@@ -761,9 +787,17 @@ def main():
                 mouse_controller.position = (int(params.get("x", 0)), int(params.get("y", 0)))
                 mouse_controller.scroll(int(params.get("dx", 0)), int(params.get("dy", 0)))
             elif action_type == "image_click":
-                if not execute_image_click(params, mouse_controller, mouse, stop_event):
+                image_found = execute_image_click(params, mouse_controller, mouse, stop_event)
+                if image_found is None:
                     print("Emergency stop requested", file=sys.stderr)
                     return 130
+                runtime_state["last_image_found"] = bool(image_found)
+            elif action_type == "if_condition":
+                jump_index = conditional_jump_target(params, runtime_state, len(actions))
+                if jump_index is not None:
+                    print(f"If Image Result jumped to action {jump_index + 1}")
+                    next_index = jump_index
+            index = next_index
         return 0
     except KeyboardInterrupt:
         print("Interrupted", file=sys.stderr)
