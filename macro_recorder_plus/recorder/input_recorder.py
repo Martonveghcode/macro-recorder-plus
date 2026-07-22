@@ -37,6 +37,10 @@ class InputRecorder(QObject):
         self._running = False
         self._paused = False
         self._held_keys: set[str] = set()
+        self._pending_modifier_presses: dict[str, float] = {}
+        self._raw_modifier_keys: set[str] = set()
+        self._shortcut_modifier_keys: set[str] = set()
+        self._shortcut_keys: set[str] = set()
         self._last_click: tuple[str, int, int, float] | None = None
         self._monitors: list[MonitorInfo] = []
         self._normalizer = EventNormalizer()
@@ -58,6 +62,7 @@ class InputRecorder(QObject):
             )
         )
         self._normalizer.reset(monotonic_seconds())
+        self._reset_keyboard_state()
         self._monitors = current_environment().monitors
 
         try:
@@ -95,6 +100,7 @@ class InputRecorder(QObject):
                 listener.stop()
         self._keyboard_listener = None
         self._mouse_listener = None
+        self._reset_keyboard_state()
         for action in self._normalizer.flush_mouse_move():
             self.actionRecorded.emit(action)
         self.stopped.emit()
@@ -104,6 +110,7 @@ class InputRecorder(QObject):
         if not self._running:
             return
         self._paused = not self._paused
+        self._reset_keyboard_state()
         self.pausedChanged.emit(self._paused)
 
     def _emit_actions(self, actions: list[MacroAction]) -> None:
@@ -136,27 +143,68 @@ class InputRecorder(QObject):
         return None
 
     def _on_key_press(self, key: object) -> None:
-        if not self._running or not self.options.record_keyboard:
+        if not self._running or self._paused or not self.options.record_keyboard:
             return
         key_name = keyboard_key_to_name(key)
         if key_name in (self.options.ignored_keys or set()):
             return
         now = monotonic_seconds()
+        already_held = key_name in self._held_keys
         self._held_keys.add(key_name)
         modifiers = sorted(key for key in self._held_keys if _is_modifier(key))
-        if modifiers and not _is_modifier(key_name):
+        if _is_modifier(key_name):
+            if not already_held and key_name not in self._raw_modifier_keys:
+                self._pending_modifier_presses[key_name] = now
+            return
+        if modifiers and _should_record_hotkey(modifiers, key_name):
+            for modifier in modifiers:
+                self._pending_modifier_presses.pop(modifier, None)
+            self._shortcut_modifier_keys.update(modifiers)
+            self._shortcut_keys.add(key_name)
             self._emit_actions(self._normalizer.add_hotkey(normalize_hotkey(modifiers + [key_name]), now))
             return
+        self._flush_active_modifiers_for_raw_input(now)
         self._emit_actions(self._normalizer.add_keyboard(key_name, "press", now))
 
     def _on_key_release(self, key: object) -> None:
-        if not self._running or not self.options.record_keyboard:
+        if not self._running or self._paused or not self.options.record_keyboard:
             return
         key_name = keyboard_key_to_name(key)
         if key_name in (self.options.ignored_keys or set()):
             return
         self._held_keys.discard(key_name)
-        self._emit_actions(self._normalizer.add_keyboard(key_name, "release", monotonic_seconds()))
+        now = monotonic_seconds()
+        if key_name in self._shortcut_keys:
+            self._shortcut_keys.discard(key_name)
+            return
+        if _is_modifier(key_name):
+            if key_name in self._pending_modifier_presses:
+                self._flush_active_modifiers_for_raw_input(now, include_released=key_name)
+            if key_name in self._raw_modifier_keys:
+                self._emit_actions(self._normalizer.add_keyboard(key_name, "release", now))
+            self._pending_modifier_presses.pop(key_name, None)
+            self._raw_modifier_keys.discard(key_name)
+            self._shortcut_modifier_keys.discard(key_name)
+            return
+        self._emit_actions(self._normalizer.add_keyboard(key_name, "release", now))
+
+    def _flush_active_modifiers_for_raw_input(self, now: float, *, include_released: str | None = None) -> None:
+        active_modifiers = {key for key in self._held_keys if _is_modifier(key)}
+        if include_released is not None:
+            active_modifiers.add(include_released)
+        for modifier in sorted(active_modifiers, key=lambda name: self._pending_modifier_presses.get(name, now)):
+            if modifier in self._raw_modifier_keys:
+                continue
+            press_time = self._pending_modifier_presses.pop(modifier, now)
+            self._emit_actions(self._normalizer.add_keyboard(modifier, "press", press_time))
+            self._raw_modifier_keys.add(modifier)
+
+    def _reset_keyboard_state(self) -> None:
+        self._held_keys.clear()
+        self._pending_modifier_presses.clear()
+        self._raw_modifier_keys.clear()
+        self._shortcut_modifier_keys.clear()
+        self._shortcut_keys.clear()
 
     def _on_mouse_move(self, x: int, y: int) -> None:
         if not self._running or self._paused or not self.options.record_mouse_movement:
@@ -168,6 +216,7 @@ class InputRecorder(QObject):
             return
         phase = "press" if pressed else "release"
         now = monotonic_seconds()
+        self._flush_active_modifiers_for_raw_input(now)
         self._emit_actions(
             self._normalizer.add_mouse_button(x, y, mouse_button_to_name(button), phase, now)
         )
@@ -180,7 +229,9 @@ class InputRecorder(QObject):
     def _on_mouse_scroll(self, x: int, y: int, dx: int, dy: int) -> None:
         if not self._running or not self.options.record_scroll:
             return
-        self._emit_actions(self._normalizer.add_scroll(x, y, dx, dy, monotonic_seconds()))
+        now = monotonic_seconds()
+        self._flush_active_modifiers_for_raw_input(now)
+        self._emit_actions(self._normalizer.add_scroll(x, y, dx, dy, now))
 
     def _is_double_click(self, button: str, x: int, y: int, now: float) -> bool:
         if self._last_click is None:
@@ -191,3 +242,7 @@ class InputRecorder(QObject):
 
 def _is_modifier(key_name: str) -> bool:
     return key_name in {"ctrl", "shift", "alt", "win"}
+
+
+def _should_record_hotkey(modifiers: list[str], key_name: str) -> bool:
+    return bool({"ctrl", "alt", "win"}.intersection(modifiers)) or "shift" in modifiers and len(key_name) != 1

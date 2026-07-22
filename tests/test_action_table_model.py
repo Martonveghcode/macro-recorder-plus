@@ -13,7 +13,11 @@ def test_action_table_model_insert_edit_remove(qtbot):
     model.insert_action(0, action)
     assert model.rowCount() == 1
 
-    delay_index = model.index(0, 4)
+    loop_index = model.index(0, 2)
+    assert model.setData(loop_index, 100000, Qt.EditRole)
+    assert model.actions[0].loop_count == 99999
+
+    delay_index = model.index(0, 5)
     assert model.setData(delay_index, 2.5, Qt.EditRole)
     assert model.actions[0].delay == 2.5
     assert model.dirty

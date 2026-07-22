@@ -49,6 +49,70 @@ def test_python_export_is_valid_and_dry_run_does_not_need_pynput(tmp_path):
     assert "0: comment" in result.stdout
 
 
+def test_python_export_dry_run_repeats_looped_actions(tmp_path):
+    document = MacroDocument(
+        name="export",
+        actions=[MacroAction(type=ActionType.COMMENT, loop_count=3, params={"text": "check"})],
+    )
+
+    path = PythonExporter().export(document, tmp_path / "exported.py")
+
+    py_compile.compile(str(path), doraise=True)
+    result = subprocess.run(
+        [sys.executable, str(path), "--dry-run"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert result.stdout.count("0: comment") == 3
+
+
+def test_python_export_dry_run_repeats_whole_macro_and_allows_override(tmp_path):
+    document = MacroDocument(
+        name="export",
+        settings={"playback_speed": 1.0, "coordinate_mode": "exact", "macro_loop_count": 3},
+        actions=[MacroAction(type=ActionType.COMMENT, params={"text": "check"})],
+    )
+    path = PythonExporter().export(document, tmp_path / "exported.py")
+
+    saved_result = subprocess.run(
+        [sys.executable, str(path), "--dry-run"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    override_result = subprocess.run(
+        [sys.executable, str(path), "--dry-run", "--loops", "2"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert saved_result.returncode == 0
+    assert saved_result.stdout.count("0: comment") == 3
+    assert override_result.returncode == 0
+    assert override_result.stdout.count("0: comment") == 2
+
+
+def test_python_export_runs_pre_actions_once_before_looped_actions(tmp_path):
+    document = MacroDocument(
+        name="export",
+        settings={"playback_speed": 1.0, "coordinate_mode": "exact", "macro_loop_count": 3},
+        pre_actions=[MacroAction(type=ActionType.COMMENT, label="setup", params={"text": "setup"})],
+        actions=[MacroAction(type=ActionType.COMMENT, label="main", params={"text": "main"})],
+    )
+    path = PythonExporter().export(document, tmp_path / "exported.py")
+
+    result = subprocess.run([sys.executable, str(path), "--dry-run"], capture_output=True, text=True, check=False)
+
+    assert result.returncode == 0
+    assert result.stdout.count("setup") == 1
+    assert result.stdout.count("main") == 3
+    assert result.stdout.index("setup") < result.stdout.index("main")
+
+
 def test_python_export_supports_open_file_dry_run(tmp_path):
     document = MacroDocument(
         name="export",
@@ -69,6 +133,29 @@ def test_python_export_supports_open_file_dry_run(tmp_path):
     assert "open_file_with_default_app" in text
     assert result.returncode == 0
     assert "0: open_file" in result.stdout
+
+
+def test_python_export_supports_open_url_window_placement(tmp_path):
+    placement = {
+        "process_path": r"C:\Program Files\Browser\browser.exe",
+        "window_title": "Browser",
+        "monitor_index": 0,
+        "x": 10,
+        "y": 20,
+        "width": 900,
+        "height": 700,
+    }
+    document = MacroDocument(
+        name="export",
+        actions=[MacroAction(type=ActionType.OPEN_URL, params={"url": "https://example.com", "window_placement": placement})],
+    )
+
+    path = PythonExporter().export(document, tmp_path / "exported.py")
+    text = path.read_text(encoding="utf-8")
+
+    py_compile.compile(str(path), doraise=True)
+    assert "arrange_existing_window" in text
+    assert "browser.exe" in text
 
 
 def test_python_export_supports_if_image_result_dry_run(tmp_path):

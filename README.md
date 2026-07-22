@@ -11,12 +11,15 @@ The macro recorder that actually works. Windows desktop app built with Python an
 ## Highlights
 
 - Record keyboard input, mouse clicks, mouse movement, and scroll actions from the desktop.
-- Edit recorded steps as structured actions before playback.
-- Add manual actions for URLs, local files, launched programs, typed text, secrets, image clicks, waits, and comments.
+- Automatically capture modifier chords such as Ctrl+C, Ctrl+V, Ctrl+X, Alt+Tab, and Ctrl+Shift+S as keyboard-shortcut actions.
+- Edit recorded steps as structured actions before playback, including per-action loop counts up to 99,999 repeats.
+- Add manual actions for URLs, local files, launched programs, typed text, secrets, image clicks, custom image-relative mouse movement, waits, and comments.
 - Export macros as standalone Python scripts with runtime dependency files and a generated `run_*.bat` launcher.
 - Build optional Windows executables through PyInstaller from inside the app.
 - Store secrets by environment variable name so passwords are not written into macro files.
-- Configure playback speed, countdowns, hotkeys, theme, accent color, and widget corner shape.
+- Configure whole-macro loop counts, playback speed, countdowns, hotkeys, theme, accent color, and widget corner shape.
+- Keep one-time setup steps in a separate pre-action list, so apps and documents open once before a repeating main macro.
+- Capture an open app window's monitor, position, size, and maximized state for exact restoration during playback.
 
 ## Install
 
@@ -36,6 +39,12 @@ The application declares per-monitor DPI awareness before creating `QApplication
 
 Appearance settings are available under **Settings > Appearance Customisation**. The default theme is dark with primary accent `#D0BCFF` and sharp corners.
 
+## Pre-actions and saved app positions
+
+Use the **Pre-actions (run once)** tab for setup work such as opening apps, documents, or URLs. These actions run once whenever you start the macro; only the **Main actions (looped)** tab is affected by the whole-macro loop count. The usual Insert Action menu, editing controls, and undo/redo work on the active tab.
+
+For an **Open URL**, **Open File**, or **Launch Program** action, arrange the target browser or app window first, then click **Capture open window position...** in its properties and choose the window. The action immediately stores its monitor identity, position, size, and maximized state. If the monitor layout later changes, playback first tries the saved monitor identity, then its monitor number, and keeps the window inside the available work area.
+
 ## Export
 
 Use **Export Python Script** to create a standalone `.py` macro runner. Exports include:
@@ -53,6 +62,7 @@ The generated script also supports direct CLI use:
 python exported_macro.py
 python exported_macro.py --install-deps
 python exported_macro.py --speed 1.5
+python exported_macro.py --loops 3
 python exported_macro.py --dry-run
 python exported_macro.py --start-action 12
 ```

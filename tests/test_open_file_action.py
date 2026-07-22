@@ -55,3 +55,24 @@ def test_launch_program_arranges_window_when_requested(monkeypatch):
     )
 
     assert calls == [((1234,), {"target_monitor": "2", "auto_focus": True, "timeout": 3.0})]
+
+
+def test_launch_program_restores_saved_window_placement(monkeypatch):
+    calls = []
+
+    class FakeProcess:
+        pid = 4321
+
+    placement = {"x": 100, "y": 50, "width": 900, "height": 700, "monitor_index": 1}
+    monkeypatch.setattr(windows_input.subprocess, "Popen", lambda command, cwd=None: FakeProcess())
+    monkeypatch.setattr(windows_input, "arrange_process_window", lambda *args, **kwargs: calls.append((args, kwargs)))
+
+    ActionExecutor(None, None).execute(
+        MacroAction(
+            type=ActionType.LAUNCH_PROGRAM,
+            params={"executable": "notepad.exe", "window_placement": placement},
+        )
+    )
+
+    assert calls[0][0] == (4321,)
+    assert calls[0][1]["window_placement"] == placement

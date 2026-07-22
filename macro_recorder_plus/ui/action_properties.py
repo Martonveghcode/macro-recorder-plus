@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -8,6 +10,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMessageBox,
@@ -19,27 +22,34 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from macro_recorder_plus.models.actions import ACTION_LABELS, DEFAULT_PARAMS, ActionType, MacroAction
+from macro_recorder_plus.models.actions import ACTION_LABELS, DEFAULT_PARAMS, MAX_ACTION_LOOP_COUNT, ActionType, MacroAction
+from macro_recorder_plus.platform.windows_input import list_open_windows
+from macro_recorder_plus.ui.region_selector import RegionSelectionOverlay
 
 
 FIELD_HELP: dict[str, tuple[str, str]] = {
     "type": ("Chooses the kind of action this macro row will perform.", "Open File opens a PDF with its default app."),
     "enabled": ("Controls whether playback runs this action or skips it.", "Turn this off to test a macro without running a risky click."),
+    "loop_count": ("Runs this action this many times before playback moves to the next row.", "3 repeats the selected action three times."),
     "label": ("Gives the action a friendly name shown in the table.", "Use Login document for a file-opening step."),
     "delay": ("Waits this many seconds before the action starts.", "0.500 waits half a second after the previous step."),
     "duration": ("Stores how long timed actions should last.", "A mouse move duration of 1.000 moves over one second."),
     "wait.seconds": ("Pauses playback for the entered number of seconds.", "2.000 waits two seconds."),
     "open_url.url": ("Opens this web address in the default browser.", "https://example.com"),
-    "open_file.file_path": ("Opens this file with the default Windows app for its type.", r"C:\Users\marto\Documents\notes.txt"),
+    "open_url.auto_focus": ("Brings the saved browser window to the foreground after opening the URL.", "Enable it when the next action interacts with the web page."),
+    "open_url.window_placement": ("Captures a browser window's monitor, position, size, and maximized state, then restores them after opening the URL.", "Arrange your browser, click Capture, and choose it from the list."),
+    "open_file.file_path": ("Opens this file with the default Windows app for its type.", r"%USERPROFILE%\Documents\notes.txt"),
     "open_file.target_monitor": ("Moves the opened file window to this monitor when Windows exposes a matching window.", "Monitor 2"),
     "open_file.auto_focus": ("Brings the opened file window to the foreground after it appears.", "Enable it before typing into the opened document."),
+    "open_file.window_placement": ("Captures an open window's monitor, position, size, and maximized state, then restores them after opening.", "Arrange the document window, click Capture, and choose it from the list."),
     "launch_program.executable": ("Starts this program or executable file.", r"C:\Windows\System32\notepad.exe"),
-    "launch_program.arguments": ("Passes extra command-line values to the program.", r'"C:\Users\marto\Documents\notes.txt"'),
-    "launch_program.working_directory": ("Runs the program as if it was started from this folder.", r"C:\Users\marto\Documents"),
+    "launch_program.arguments": ("Passes extra command-line values to the program.", r'"%USERPROFILE%\Documents\notes.txt"'),
+    "launch_program.working_directory": ("Runs the program as if it was started from this folder.", r"%USERPROFILE%\Documents"),
     "launch_program.target_monitor": ("Moves the launched program window to this monitor when Windows exposes a matching window.", "Primary"),
     "launch_program.auto_focus": ("Brings the launched program window to the foreground after it appears.", "Enable it when the next macro step types into that app."),
     "launch_program.wait_for_startup": ("Records whether the macro should wait briefly after starting the program.", "Enable it when the next step needs the app window to appear first."),
     "launch_program.startup_timeout": ("Limits how many seconds startup waiting may take.", "10.000 stops waiting after ten seconds."),
+    "launch_program.window_placement": ("Captures an open window's monitor, position, size, and maximized state, then restores them after launch.", "Arrange the app window, click Capture, and choose it from the list."),
     "type_text.text": ("Types this exact text during playback.", "hello world"),
     "type_secret.environment_variable": (
         "Reads os.environ[NAME] from the running app or exported script, so the secret comes from Windows environment variables or the terminal environment that launched it.",
@@ -60,18 +70,44 @@ FIELD_HELP: dict[str, tuple[str, str]] = {
     "scroll.dy": ("Scrolls vertically by this amount.", "-3 scrolls down."),
     "scroll.x": ("Moves the pointer to this horizontal coordinate before scrolling.", "500"),
     "scroll.y": ("Moves the pointer to this vertical coordinate before scrolling.", "300"),
-    "image_click.image_path": ("Finds this image on screen before clicking or moving.", r"C:\Users\marto\Pictures\button.png"),
+    "image_click.image_path": ("Finds this image on screen before clicking or moving.", r"%USERPROFILE%\Pictures\button.png"),
     "image_click.click_action": ("Chooses what to do when the image is found.", "left_click clicks the image center."),
     "image_click.confidence": ("Sets how closely the screen must match the image.", "0.850 allows a small visual difference."),
     "image_click.wait_until_found": ("Keeps checking until the image appears or the timeout is reached.", "Enable it for buttons that load slowly."),
     "image_click.timeout": ("Limits how long image searching may wait.", "0.000 waits forever until stopped."),
     "image_click.checks_per_second": ("Controls how often the screen is checked for the image.", "4.000 checks four times per second."),
     "image_click.grayscale": ("Matches images without relying on color.", "Enable it when dark mode changes button colors."),
+    "image_click.verification_attempts": (
+        "Requires the same image result to be seen across multiple quick captures before playback trusts it.",
+        "2 ignores one bad frame but still reacts quickly.",
+    ),
+    "image_click.stable_match_pixels": (
+        "Allows this many pixels of movement between verification captures while still treating the match as stable.",
+        "8 works well for static buttons on normal displays.",
+    ),
+    "image_click.scale_tolerance": (
+        "Searches slightly resized versions of the button image to survive DPI, browser zoom, or anti-aliasing changes.",
+        "0.050 checks roughly ±5% scale.",
+    ),
     "image_click.on_not_found": ("Chooses whether playback errors or skips when the image is missing.", "skip continues to the next action."),
     "image_click.region_x": ("Limits image searching to a region starting at this horizontal coordinate.", "0 starts at the left edge."),
     "image_click.region_y": ("Limits image searching to a region starting at this vertical coordinate.", "0 starts at the top edge."),
     "image_click.region_width": ("Limits image searching to this region width.", "800 searches an 800-pixel-wide area."),
     "image_click.region_height": ("Limits image searching to this region height.", "600 searches a 600-pixel-tall area."),
+    "image_click.region_picker": (
+        "Opens a transparent monitor overlay so you can drag a red box around the area where the image should be found.",
+        "Click Select region, drag around the button area, then Apply.",
+    ),
+    "image_click.movement_start_offset_x": ("Starts custom movement this many pixels horizontally from the matched image center.", "0 starts at the image center."),
+    "image_click.movement_start_offset_y": ("Starts custom movement this many pixels vertically from the matched image center.", "0 starts at the image center."),
+    "image_click.movement_end_offset_x": ("Ends custom movement this many pixels horizontally from the matched image center.", "80 ends 80 pixels to the right."),
+    "image_click.movement_end_offset_y": ("Ends custom movement this many pixels vertically from the matched image center.", "20 ends 20 pixels below the center."),
+    "image_click.movement_duration": ("Controls how long the custom mouse movement takes.", "0.500 moves over half a second."),
+    "image_click.movement_button": ("Chooses which mouse button the custom movement uses.", "left"),
+    "image_click.movement_button_action": (
+        "Chooses whether the movement clicks, presses, releases, or holds the selected mouse button.",
+        "hold_during_move presses at the start and releases at the end.",
+    ),
     "if_condition.image_found_action": (
         "Jumps to this 1-based action number when the previous image action found its image. Use 0 to continue normally.",
         "5 jumps to action 5.",
@@ -103,6 +139,7 @@ class ActionProperties(QWidget):
         self._action: MacroAction | None = None
         self._updating = False
         self.param_widgets: dict[str, QWidget] = {}
+        self._region_overlay: RegionSelectionOverlay | None = None
 
         layout = QVBoxLayout(self)
         self.empty_label = QLabel("No action selected")
@@ -114,6 +151,8 @@ class ActionProperties(QWidget):
         for action_type, label in ACTION_LABELS.items():
             self.type_combo.addItem(label, action_type.value)
         self.enabled_check = QCheckBox()
+        self.loop_spin = QSpinBox()
+        self.loop_spin.setRange(1, MAX_ACTION_LOOP_COUNT)
         self.label_edit = QLineEdit()
         self.delay_spin = QDoubleSpinBox()
         self.delay_spin.setRange(0, 3600)
@@ -129,6 +168,7 @@ class ActionProperties(QWidget):
 
         self._add_form_row(form, "Type", self.type_combo, "type")
         self._add_form_row(form, "Enabled", self.enabled_check, "enabled")
+        self._add_form_row(form, "Loops", self.loop_spin, "loop_count")
         self._add_form_row(form, "Label", self.label_edit, "label")
         self._add_form_row(form, "Delay", self.delay_spin, "delay")
         self._add_form_row(form, "Duration", self.duration_spin, "duration")
@@ -152,6 +192,7 @@ class ActionProperties(QWidget):
         self._updating = True
         self.type_combo.setCurrentIndex(self.type_combo.findData(action.type.value))
         self.enabled_check.setChecked(action.enabled)
+        self.loop_spin.setValue(action.loop_count)
         self.label_edit.setText(action.label)
         self.delay_spin.setValue(action.delay)
         self.duration_spin.setValue(action.duration)
@@ -167,6 +208,7 @@ class ActionProperties(QWidget):
         action = self._action.with_changes(
             type=action_type,
             enabled=self.enabled_check.isChecked(),
+            loop_count=self.loop_spin.value(),
             label=self.label_edit.text(),
             delay=self.delay_spin.value(),
             duration=self.duration_spin.value(),
@@ -188,6 +230,8 @@ class ActionProperties(QWidget):
                 self._add_double("seconds", "Seconds", float(params.get("seconds", 1.0)), 0, 3600, "wait.seconds")
             case ActionType.OPEN_URL:
                 self._add_line("url", "URL", str(params.get("url", "")), "open_url.url")
+                self._add_bool("auto_focus", "Auto focus", bool(params.get("auto_focus", False)), "open_url.auto_focus")
+                self._add_window_placement_picker(params.get("window_placement"), "open_url.window_placement")
             case ActionType.OPEN_FILE:
                 self._add_file(
                     "file_path",
@@ -199,6 +243,7 @@ class ActionProperties(QWidget):
                 )
                 self._add_monitor_combo("target_monitor", "Monitor", str(params.get("target_monitor", "default")), "open_file.target_monitor")
                 self._add_bool("auto_focus", "Auto focus", bool(params.get("auto_focus", False)), "open_file.auto_focus")
+                self._add_window_placement_picker(params.get("window_placement"), "open_file.window_placement")
             case ActionType.LAUNCH_PROGRAM:
                 self._add_file(
                     "executable",
@@ -219,6 +264,7 @@ class ActionProperties(QWidget):
                 self._add_bool("auto_focus", "Auto focus", bool(params.get("auto_focus", False)), "launch_program.auto_focus")
                 self._add_bool("wait_for_startup", "Wait for startup", bool(params.get("wait_for_startup", False)), "launch_program.wait_for_startup")
                 self._add_double("startup_timeout", "Startup timeout", float(params.get("startup_timeout", 10.0)), 0, 300, "launch_program.startup_timeout")
+                self._add_window_placement_picker(params.get("window_placement"), "launch_program.window_placement")
             case ActionType.TYPE_TEXT:
                 self._add_plain("text", "Text", str(params.get("text", "")), "type_text.text")
             case ActionType.TYPE_SECRET:
@@ -258,7 +304,7 @@ class ActionProperties(QWidget):
                 self._add_combo(
                     "click_action",
                     "Action",
-                    ["left_click", "right_click", "middle_click", "double_click", "move_only"],
+                    ["left_click", "right_click", "middle_click", "double_click", "move_only", "custom_movement"],
                     str(params.get("click_action", "left_click")),
                     "image_click.click_action",
                 )
@@ -267,11 +313,80 @@ class ActionProperties(QWidget):
                 self._add_double("timeout", "Max wait seconds (0 = forever)", float(params.get("timeout", 5.0)), 0.0, 3600.0, "image_click.timeout")
                 self._add_double("checks_per_second", "Checks per second", _checks_per_second_from_params(params), 0.1, 60.0, "image_click.checks_per_second")
                 self._add_bool("grayscale", "Grayscale match", bool(params.get("grayscale", True)), "image_click.grayscale")
+                self._add_int("verification_attempts", "Verify captures", int(params.get("verification_attempts", 2)), 1, 10, "image_click.verification_attempts")
+                self._add_int("stable_match_pixels", "Stable within px", int(params.get("stable_match_pixels", 8)), 0, 200, "image_click.stable_match_pixels")
+                self._add_double("scale_tolerance", "Scale tolerance", float(params.get("scale_tolerance", 0.05)), 0.0, 0.25, "image_click.scale_tolerance")
                 self._add_combo("on_not_found", "If not found", ["error", "skip"], str(params.get("on_not_found", "error")), "image_click.on_not_found")
                 self._add_int("region_x", "Region X", int(params.get("region_x", 0)), -100000, 100000, "image_click.region_x")
                 self._add_int("region_y", "Region Y", int(params.get("region_y", 0)), -100000, 100000, "image_click.region_y")
                 self._add_int("region_width", "Region width", int(params.get("region_width", 0)), 0, 100000, "image_click.region_width")
                 self._add_int("region_height", "Region height", int(params.get("region_height", 0)), 0, 100000, "image_click.region_height")
+                self._add_region_picker()
+                start_offset = _pair_from_params(params, "movement_start_offset")
+                end_offset = _pair_from_params(params, "movement_end_offset")
+                self._add_int(
+                    "movement_start_offset_x",
+                    "Move start X offset",
+                    start_offset[0],
+                    -100000,
+                    100000,
+                    "image_click.movement_start_offset_x",
+                )
+                self._add_int(
+                    "movement_start_offset_y",
+                    "Move start Y offset",
+                    start_offset[1],
+                    -100000,
+                    100000,
+                    "image_click.movement_start_offset_y",
+                )
+                self._add_int(
+                    "movement_end_offset_x",
+                    "Move end X offset",
+                    end_offset[0],
+                    -100000,
+                    100000,
+                    "image_click.movement_end_offset_x",
+                )
+                self._add_int(
+                    "movement_end_offset_y",
+                    "Move end Y offset",
+                    end_offset[1],
+                    -100000,
+                    100000,
+                    "image_click.movement_end_offset_y",
+                )
+                self._add_double(
+                    "movement_duration",
+                    "Move duration",
+                    float(params.get("movement_duration", 0.5)),
+                    0.0,
+                    3600.0,
+                    "image_click.movement_duration",
+                )
+                self._add_combo(
+                    "movement_button",
+                    "Move button",
+                    ["left", "right", "middle"],
+                    str(params.get("movement_button", "left")),
+                    "image_click.movement_button",
+                )
+                self._add_combo(
+                    "movement_button_action",
+                    "Move button action",
+                    [
+                        "none",
+                        "click_at_start",
+                        "click_at_end",
+                        "double_click_at_start",
+                        "double_click_at_end",
+                        "hold_during_move",
+                        "press_at_start",
+                        "release_at_end",
+                    ],
+                    str(params.get("movement_button_action", "none")),
+                    "image_click.movement_button_action",
+                )
             case ActionType.IF_CONDITION:
                 self._add_int(
                     "image_found_action",
@@ -302,6 +417,7 @@ class ActionProperties(QWidget):
                 self.duration_spin.setValue(params["seconds"])
             case ActionType.OPEN_URL:
                 params["url"] = self.param_widgets["url"].text()
+                params["auto_focus"] = self.param_widgets["auto_focus"].isChecked()
             case ActionType.OPEN_FILE:
                 params["file_path"] = self.param_widgets["file_path"].text()
                 params["target_monitor"] = str(self.param_widgets["target_monitor"].currentData() or "default")
@@ -342,9 +458,23 @@ class ActionProperties(QWidget):
                 params["checks_per_second"] = self.param_widgets["checks_per_second"].value()
                 params["poll_interval"] = 1.0 / max(0.1, params["checks_per_second"])
                 params["grayscale"] = self.param_widgets["grayscale"].isChecked()
+                params["verification_attempts"] = self.param_widgets["verification_attempts"].value()
+                params["stable_match_pixels"] = self.param_widgets["stable_match_pixels"].value()
+                params["scale_tolerance"] = self.param_widgets["scale_tolerance"].value()
                 params["on_not_found"] = self.param_widgets["on_not_found"].currentText()
                 for key in ["region_x", "region_y", "region_width", "region_height"]:
                     params[key] = self.param_widgets[key].value()
+                params["movement_start_offset"] = [
+                    self.param_widgets["movement_start_offset_x"].value(),
+                    self.param_widgets["movement_start_offset_y"].value(),
+                ]
+                params["movement_end_offset"] = [
+                    self.param_widgets["movement_end_offset_x"].value(),
+                    self.param_widgets["movement_end_offset_y"].value(),
+                ]
+                params["movement_duration"] = self.param_widgets["movement_duration"].value()
+                params["movement_button"] = self.param_widgets["movement_button"].currentText()
+                params["movement_button_action"] = self.param_widgets["movement_button_action"].currentText()
             case ActionType.IF_CONDITION:
                 params["image_found_action"] = self.param_widgets["image_found_action"].value()
                 params["image_not_found_action"] = self.param_widgets["image_not_found_action"].value()
@@ -394,6 +524,98 @@ class ActionProperties(QWidget):
         button.setToolTip(message.replace("\n\n", " "))
         button.clicked.connect(lambda _checked=False, title=label, body=message: QMessageBox.information(self, title, body))
         return button
+
+    def _add_region_picker(self) -> None:
+        row = QWidget()
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        button = QPushButton("Select region on screen")
+        button.setToolTip("Drag a red box over the screen area where this image should be searched")
+        button.clicked.connect(self._select_image_region)
+        layout.addWidget(button)
+        layout.addStretch(1)
+        self._add_param_row("Region picker", row, "image_click.region_picker")
+
+    def _add_window_placement_picker(self, placement: object, help_key: str) -> None:
+        row = QWidget()
+        layout = QVBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        button = QPushButton("Capture open window position...")
+        button.setToolTip("Choose one of the windows currently open on your desktop")
+        button.clicked.connect(self._capture_open_window_position)
+        status = QLabel(_window_placement_summary(placement))
+        status.setWordWrap(True)
+        layout.addWidget(button)
+        layout.addWidget(status)
+        self.param_widgets["window_placement_status"] = status
+        self._add_param_row("Saved position", row, help_key)
+
+    def _capture_open_window_position(self) -> None:
+        if self._action is None or self._action.type not in {ActionType.OPEN_URL, ActionType.OPEN_FILE, ActionType.LAUNCH_PROGRAM}:
+            return
+        windows = list_open_windows()
+        if not windows:
+            QMessageBox.warning(self, "No windows found", "No capturable open windows were found. This feature is available on Windows.")
+            return
+        labels = []
+        for window in windows:
+            placement = window["placement"]
+            app_name = Path(str(window.get("process_path", ""))).name or "Unknown app"
+            monitor_number = int(placement.get("monitor_index", -1)) + 1
+            labels.append(f"{window['title']} — {app_name} — Monitor {monitor_number} — PID {window['process_id']}")
+        selected, accepted = QInputDialog.getItem(
+            self,
+            "Capture Window Position",
+            "Choose the already-arranged window to restore when this action runs:",
+            labels,
+            0,
+            False,
+        )
+        if not accepted:
+            return
+        captured_window = windows[labels.index(selected)]
+        placement = dict(captured_window["placement"])
+        placement["window_title"] = str(captured_window.get("title", ""))
+        placement["process_path"] = str(captured_window.get("process_path", ""))
+        params = dict(self._action.params)
+        params["window_placement"] = placement
+        self._action = self._action.with_changes(params=params)
+        status = self.param_widgets.get("window_placement_status")
+        if isinstance(status, QLabel):
+            status.setText(_window_placement_summary(placement))
+        monitor_combo = self.param_widgets.get("target_monitor")
+        if isinstance(monitor_combo, QComboBox):
+            index = monitor_combo.findData(str(int(placement.get("monitor_index", -1)) + 1))
+            if index >= 0:
+                monitor_combo.setCurrentIndex(index)
+        self._emit_change()
+
+    def _select_image_region(self) -> None:
+        required = {"region_x", "region_y", "region_width", "region_height"}
+        if not required.issubset(self.param_widgets):
+            return
+        current_region = (
+            self.param_widgets["region_x"].value(),
+            self.param_widgets["region_y"].value(),
+            self.param_widgets["region_width"].value(),
+            self.param_widgets["region_height"].value(),
+        )
+        if current_region[2] <= 0 or current_region[3] <= 0:
+            current_region = None
+        overlay = RegionSelectionOverlay(current_region)
+        overlay.regionSelected.connect(self._set_image_region)
+        overlay.cancelled.connect(lambda: setattr(self, "_region_overlay", None))
+        overlay.destroyed.connect(lambda: setattr(self, "_region_overlay", None))
+        self._region_overlay = overlay
+        overlay.show()
+
+    def _set_image_region(self, x: int, y: int, width: int, height: int) -> None:
+        if not {"region_x", "region_y", "region_width", "region_height"}.issubset(self.param_widgets):
+            return
+        self.param_widgets["region_x"].setValue(int(x))
+        self.param_widgets["region_y"].setValue(int(y))
+        self.param_widgets["region_width"].setValue(max(0, int(width)))
+        self.param_widgets["region_height"].setValue(max(0, int(height)))
 
     def _add_line(self, key: str, label: str, value: str, help_key: str) -> None:
         widget = QLineEdit(value)
@@ -502,3 +724,22 @@ def _checks_per_second_from_params(params: dict) -> float:
         return max(0.1, float(params.get("checks_per_second") or 4.0))
     poll_interval = max(0.05, float(params.get("poll_interval", 0.25) or 0.25))
     return max(0.1, 1.0 / poll_interval)
+
+
+def _pair_from_params(params: dict, key: str) -> tuple[int, int]:
+    value = params.get(key, [0, 0])
+    if not isinstance(value, (list, tuple)) or len(value) < 2:
+        return (0, 0)
+    return (int(value[0]), int(value[1]))
+
+
+def _window_placement_summary(placement: object) -> str:
+    if not isinstance(placement, dict) or not placement:
+        return "No saved position (the Monitor setting is used)."
+    monitor = int(placement.get("monitor_index", -1)) + 1
+    width = int(placement.get("width", 0) or 0)
+    height = int(placement.get("height", 0) or 0)
+    x = int(placement.get("x", 0) or 0)
+    y = int(placement.get("y", 0) or 0)
+    state = ", maximized" if placement.get("maximized") else ""
+    return f"Monitor {monitor}: {width} x {height} at ({x}, {y}){state}"
