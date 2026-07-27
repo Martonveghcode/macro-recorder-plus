@@ -5,7 +5,7 @@ from pathlib import Path
 from PySide6.QtCore import QSettings
 from PySide6.QtWidgets import QDialog
 
-from macro_recorder_plus.models.actions import ActionType, create_action
+from macro_recorder_plus.models.actions import ActionType, MacroAction, create_action
 from macro_recorder_plus.models.macro import MacroDocument
 from macro_recorder_plus.recorder.input_recorder import RecordingOptions
 from macro_recorder_plus.storage.json_store import save_macro
@@ -35,6 +35,44 @@ def test_run_without_macro_reports_status(tmp_path, qtbot):
     window.run_button.click()
 
     assert window.status.currentMessage() == "No actions to run"
+
+
+def test_macro_loop_setting_is_saved_and_passed_to_playback(tmp_path, qtbot, monkeypatch):
+    settings = QSettings(str(tmp_path / "settings.ini"), QSettings.IniFormat)
+    window = MainWindow(settings=settings, log_path=Path(tmp_path / "app.log"))
+    qtbot.addWidget(window)
+    window.document = MacroDocument(name="looped", actions=[create_action(ActionType.COMMENT)])
+    window.model.replace_actions(window.document.actions)
+    window.macro_loop_spin.setValue(5)
+    calls = []
+    monkeypatch.setattr(window.playback, "play", lambda actions, **kwargs: calls.append(kwargs))
+
+    window._start_playback(0)
+
+    assert window.document.settings["macro_loop_count"] == 5
+    assert calls[0]["repeat_count"] == 5
+    window.model.set_dirty(False)
+
+
+def test_pre_actions_are_passed_once_outside_main_macro_loop(tmp_path, qtbot, monkeypatch):
+    settings = QSettings(str(tmp_path / "settings.ini"), QSettings.IniFormat)
+    window = MainWindow(settings=settings, log_path=Path(tmp_path / "app.log"))
+    qtbot.addWidget(window)
+    pre_action = create_action(ActionType.LAUNCH_PROGRAM)
+    main_action = create_action(ActionType.COMMENT)
+    window.document = MacroDocument(name="prepared", pre_actions=[pre_action], actions=[main_action])
+    window.model.replace_actions(window.document.actions)
+    window.pre_action_model.replace_actions(window.document.pre_actions)
+    window.macro_loop_spin.setValue(7)
+    calls = []
+    monkeypatch.setattr(window.playback, "play", lambda actions, **kwargs: calls.append((actions, kwargs)))
+
+    window._start_playback(0)
+
+    assert calls[0][0] == [main_action]
+    assert calls[0][1]["pre_actions"] == [pre_action]
+    assert calls[0][1]["repeat_count"] == 7
+    window.model.set_dirty(False)
 
 
 def test_open_saved_macro_enables_export_actions(tmp_path, qtbot):
@@ -109,3 +147,54 @@ def test_open_settings_restarts_hotkeys_when_dialog_is_accepted(tmp_path, qtbot,
     window.open_settings()
 
     assert calls == ["theme", "refresh", "restart"]
+
+
+def test_step_forward_runs_a_shortcut_chord_as_one_unit_and_back_repositions(tmp_path, qtbot, monkeypatch):
+    settings = QSettings(str(tmp_path / "settings.ini"), QSettings.IniFormat)
+    window = MainWindow(settings=settings, log_path=Path(tmp_path / "app.log"))
+    qtbot.addWidget(window)
+    actions = [
+        MacroAction(type=ActionType.KEY_PRESS, params={"key": "ctrl", "phase": "press"}),
+        MacroAction(type=ActionType.KEY_PRESS, params={"key": "v", "phase": "press"}),
+        MacroAction(type=ActionType.KEY_PRESS, params={"key": "v", "phase": "release"}),
+        MacroAction(type=ActionType.KEY_PRESS, params={"key": "ctrl", "phase": "release"}),
+        create_action(ActionType.MOUSE_MOVE),
+    ]
+    window.document = MacroDocument(name="stepped", actions=actions)
+    window.model.replace_actions(actions)
+    calls = []
+    monkeypatch.setattr(window.playback, "play", lambda recorded_actions, **kwargs: calls.append(kwargs))
+
+    window.step_forward()
+
+    assert calls[0]["start_index"] == 0
+    assert calls[0]["end_index"] == 4
+    assert calls[0]["repeat_count"] == 1
+    assert calls[0]["respect_action_delays"] is False
+    window._playback_context(4, None)
+    window._playback_finished(True, "Playback complete")
+    assert window._step_cursor == 4
+
+    window.step_back()
+
+    assert window._step_cursor == 0
+    assert window.model.current_playback_row == 0
+
+
+def test_step_forward_treats_common_shortcuts_as_individual_actions(tmp_path, qtbot, monkeypatch):
+    settings = QSettings(str(tmp_path / "settings.ini"), QSettings.IniFormat)
+    window = MainWindow(settings=settings, log_path=Path(tmp_path / "app.log"))
+    qtbot.addWidget(window)
+    actions = [
+        MacroAction(type=ActionType.HOTKEY, params={"keys": ["ctrl", key]})
+        for key in ["a", "c", "x", "v"]
+    ]
+    window.document = MacroDocument(name="shortcuts", actions=actions)
+    window.model.replace_actions(actions)
+    calls = []
+    monkeypatch.setattr(window.playback, "play", lambda recorded_actions, **kwargs: calls.append(kwargs))
+
+    window.step_forward()
+
+    assert calls[0]["start_index"] == 0
+    assert calls[0]["end_index"] == 1

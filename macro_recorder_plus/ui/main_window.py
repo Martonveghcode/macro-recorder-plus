@@ -20,10 +20,12 @@ from PySide6.QtWidgets import (
     QProgressDialog,
     QPushButton,
     QSplitter,
+    QSpinBox,
     QStatusBar,
     QStyle,
     QSystemTrayIcon,
     QTableView,
+    QTabWidget,
     QToolBar,
     QVBoxLayout,
     QWidget,
@@ -31,9 +33,9 @@ from PySide6.QtWidgets import (
 
 from macro_recorder_plus.exporters.pyinstaller_exporter import PyInstallerExporter, split_pyinstaller_options
 from macro_recorder_plus.exporters.python_exporter import PythonExporter, default_export_directory, safe_script_filename
-from macro_recorder_plus.models.actions import ACTION_LABELS, ActionType, MacroAction, create_action
+from macro_recorder_plus.models.actions import ACTION_LABELS, ActionType, MacroAction, clamp_loop_count, create_action
 from macro_recorder_plus.models.environment import current_environment
-from macro_recorder_plus.models.macro import MacroDocument
+from macro_recorder_plus.models.macro import MAX_MACRO_LOOP_COUNT, MacroDocument, clamp_macro_loop_count
 from macro_recorder_plus.platform.windows_hotkeys import DEFAULT_HOTKEYS, HotkeyManager
 from macro_recorder_plus.playback.playback_engine import PlaybackEngine
 from macro_recorder_plus.recorder.input_recorder import InputRecorder, RecordingOptions
@@ -48,6 +50,7 @@ from macro_recorder_plus.ui.recording_dialog import RecordingDialog
 from macro_recorder_plus.ui.settings_dialog import SettingsDialog
 from macro_recorder_plus.ui.state import AppState
 from macro_recorder_plus.ui.theme import apply_theme
+from macro_recorder_plus.utilities.action_steps import LogicalActionStep, logical_action_steps, step_at_or_after, step_before
 from macro_recorder_plus.utilities.sound import play_notification
 
 
@@ -63,6 +66,14 @@ class MainWindow(QMainWindow):
         self.current_path: Path | None = None
         self.state = AppState.IDLE
         self.recording_hidden = False
+        self._step_cursor = 0
+        self._step_mode = False
+        self._step_active: LogicalActionStep | None = None
+        self._step_pending_cursor: int | None = None
+        self._step_pending_image_found: bool | None = None
+        self._step_context: dict[int, bool | None] = {0: None}
+        self._step_history: list[int] = []
+        self._updating_step_selection = False
 
         self.undo_stack = QUndoStack(self)
         self.model = ActionTableModel(self.document.actions, self)
@@ -71,6 +82,16 @@ class MainWindow(QMainWindow):
         self.model.rowsInserted.connect(self._refresh_controls)
         self.model.rowsRemoved.connect(self._refresh_controls)
         self.model.layoutChanged.connect(self._refresh_controls)
+        self.model.modelReset.connect(lambda *_args: self._reset_step_session())
+        self.model.rowsInserted.connect(lambda *_args: self._reset_step_session())
+        self.model.rowsRemoved.connect(lambda *_args: self._reset_step_session())
+        self.model.layoutChanged.connect(lambda *_args: self._reset_step_session())
+        self.pre_action_model = ActionTableModel(self.document.pre_actions, self)
+        self.pre_action_model.dirtyChanged.connect(self._on_dirty_changed)
+        self.pre_action_model.modelReset.connect(self._refresh_controls)
+        self.pre_action_model.rowsInserted.connect(self._refresh_controls)
+        self.pre_action_model.rowsRemoved.connect(self._refresh_controls)
+        self.pre_action_model.layoutChanged.connect(self._refresh_controls)
         self.recorder = InputRecorder(self)
         self.recorder.actionRecorded.connect(self._append_recorded_action, Qt.ConnectionType.QueuedConnection)
         self.recorder.started.connect(self._recording_started)
@@ -80,6 +101,8 @@ class MainWindow(QMainWindow):
 
         self.playback = PlaybackEngine(self)
         self.playback.progress.connect(self._playback_progress)
+        self.playback.preActionProgress.connect(self._pre_action_progress)
+        self.playback.playbackContext.connect(self._playback_context)
         self.playback.finished.connect(self._playback_finished)
         self.playback.error.connect(self._show_error)
         self.playback.status.connect(lambda message: self.statusBar().showMessage(message))
@@ -134,6 +157,16 @@ class MainWindow(QMainWindow):
 
         self.act_run_selected = QAction("Run From Selected Action", self)
         self.act_run_selected.triggered.connect(self.run_from_selected)
+
+        self.act_step_back = QAction(style.standardIcon(QStyle.SP_MediaSeekBackward), "Step Back", self)
+        self.act_step_back.setShortcut(QKeySequence("Shift+F11"))
+        self.act_step_back.setToolTip("Move the test cursor back one logical action (does not undo external effects)")
+        self.act_step_back.triggered.connect(self.step_back)
+
+        self.act_step_forward = QAction(style.standardIcon(QStyle.SP_MediaSeekForward), "Step Forward", self)
+        self.act_step_forward.setShortcut(QKeySequence("F11"))
+        self.act_step_forward.setToolTip("Execute the next logical action without its recorded idle delay")
+        self.act_step_forward.triggered.connect(self.step_forward)
 
         self.act_pause_active = QAction(style.standardIcon(QStyle.SP_MediaPause), "Pause", self)
         self.act_pause_active.setShortcut(QKeySequence("F6"))
@@ -229,6 +262,10 @@ class MainWindow(QMainWindow):
         playback_menu = self.menuBar().addMenu("&Playback")
         playback_menu.addAction(self.act_run)
         playback_menu.addAction(self.act_run_selected)
+        playback_menu.addSeparator()
+        playback_menu.addAction(self.act_step_back)
+        playback_menu.addAction(self.act_step_forward)
+        playback_menu.addSeparator()
         playback_menu.addAction(self.act_pause_active)
         playback_menu.addAction(self.act_stop_active)
 
@@ -254,6 +291,18 @@ class MainWindow(QMainWindow):
         self.run_button = QPushButton("Run")
         self.run_button.setToolTip("Run macro from the beginning")
         self.run_button.clicked.connect(self.run_macro)
+        self.step_back_button = QPushButton("\u25c0 Step Back")
+        self.step_back_button.setToolTip("Move back one logical action; this does not undo actions already performed (Shift+F11)")
+        self.step_back_button.clicked.connect(self.step_back)
+        self.step_forward_button = QPushButton("Step Forward \u25b6")
+        self.step_forward_button.setToolTip("Test one logical action at a time; shortcuts and clicks stay together (F11)")
+        self.step_forward_button.clicked.connect(self.step_forward)
+        self.macro_loop_spin = QSpinBox()
+        self.macro_loop_spin.setRange(1, MAX_MACRO_LOOP_COUNT)
+        self.macro_loop_spin.setValue(clamp_macro_loop_count(self.document.settings.get("macro_loop_count", 1)))
+        self.macro_loop_spin.setToolTip("Run the whole macro this many times")
+        self.macro_loop_spin.setSuffix(" times")
+        self.macro_loop_spin.valueChanged.connect(self._macro_loop_count_changed)
         self.pause_button = QPushButton("Pause")
         self.pause_button.setToolTip("Pause or resume recording/playback")
         self.pause_button.clicked.connect(self.pause_active)
@@ -273,6 +322,10 @@ class MainWindow(QMainWindow):
         self.progress.setValue(0)
         controls.addWidget(self.record_button)
         controls.addWidget(self.run_button)
+        controls.addWidget(self.step_back_button)
+        controls.addWidget(self.step_forward_button)
+        controls.addWidget(QLabel("Macro loops"))
+        controls.addWidget(self.macro_loop_spin)
         controls.addWidget(self.pause_button)
         controls.addWidget(self.stop_button)
         controls.addSpacing(16)
@@ -285,18 +338,15 @@ class MainWindow(QMainWindow):
         central_layout.addWidget(self.countdown_banner)
 
         splitter = QSplitter(Qt.Horizontal)
-        self.table = QTableView()
-        self.table.setModel(self.model)
-        self.table.setSelectionBehavior(QTableView.SelectRows)
-        self.table.setSelectionMode(QTableView.ExtendedSelection)
-        self.table.setAlternatingRowColors(True)
-        self.table.setSortingEnabled(False)
-        self.table.verticalHeader().setVisible(False)
-        self.table.horizontalHeader().setStretchLastSection(True)
-        self.table.doubleClicked.connect(lambda _index: self.properties.apply_button.setFocus())
-        self.table.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.table.customContextMenuRequested.connect(self._show_context_menu)
-        splitter.addWidget(self.table)
+        self.action_tabs = QTabWidget()
+        self.table = self._create_action_table(self.model)
+        self.pre_action_table = self._create_action_table(self.pre_action_model)
+        self.action_tabs.addTab(self.table, "Main actions (looped)")
+        self.action_tabs.addTab(self.pre_action_table, "Pre-actions (run once)")
+        self.action_tabs.setTabToolTip(0, "These actions repeat according to Macro loops")
+        self.action_tabs.setTabToolTip(1, "These actions run once whenever the macro is started, before the main loop")
+        self.action_tabs.currentChanged.connect(self._action_tab_changed)
+        splitter.addWidget(self.action_tabs)
 
         self.properties = ActionProperties()
         self.properties.setMinimumWidth(320)
@@ -307,7 +357,6 @@ class MainWindow(QMainWindow):
         self.splitter = splitter
         self.setCentralWidget(central)
 
-        self.table.selectionModel().selectionChanged.connect(self._selection_changed)
         self.status = QStatusBar(self)
         self.setStatusBar(self.status)
         self.status.showMessage("Ready")
@@ -321,8 +370,37 @@ class MainWindow(QMainWindow):
 
         self._refresh_recent_menu()
 
+    def _create_action_table(self, model: ActionTableModel) -> QTableView:
+        table = QTableView()
+        table.setModel(model)
+        table.setSelectionBehavior(QTableView.SelectRows)
+        table.setSelectionMode(QTableView.ExtendedSelection)
+        table.setAlternatingRowColors(True)
+        table.setSortingEnabled(False)
+        table.verticalHeader().setVisible(False)
+        table.horizontalHeader().setStretchLastSection(True)
+        table.doubleClicked.connect(lambda _index: self.properties.apply_button.setFocus())
+        table.setContextMenuPolicy(Qt.CustomContextMenu)
+        table.customContextMenuRequested.connect(self._show_context_menu)
+        table.selectionModel().selectionChanged.connect(self._selection_changed)
+        return table
+
+    def _active_model(self) -> ActionTableModel:
+        if hasattr(self, "action_tabs") and self.action_tabs.currentIndex() == 1:
+            return self.pre_action_model
+        return self.model
+
+    def _active_table(self) -> QTableView:
+        if hasattr(self, "action_tabs") and self.action_tabs.currentIndex() == 1:
+            return self.pre_action_table
+        return self.table
+
+    def _action_tab_changed(self, _index: int) -> None:
+        self._selection_changed()
+        self._refresh_controls()
+
     def _selected_rows(self) -> list[int]:
-        return sorted({index.row() for index in self.table.selectionModel().selectedRows()})
+        return sorted({index.row() for index in self._active_table().selectionModel().selectedRows()})
 
     def _selected_row(self) -> int:
         rows = self._selected_rows()
@@ -330,8 +408,12 @@ class MainWindow(QMainWindow):
 
     def _selection_changed(self) -> None:
         row = self._selected_row()
-        action = self.model.actions[row] if 0 <= row < len(self.model.actions) else None
+        active_model = self._active_model()
+        action = active_model.actions[row] if 0 <= row < len(active_model.actions) else None
         self.properties.set_action(row, action)
+        if active_model is self.model and not self._updating_step_selection and self.state == AppState.IDLE and row >= 0:
+            self._reset_step_session(row)
+            self.model.set_playback_row(-1)
 
     def _show_context_menu(self, position) -> None:
         menu = QMenu(self)
@@ -341,7 +423,7 @@ class MainWindow(QMainWindow):
         menu.addAction(self.act_delete)
         menu.addAction(self.act_move_up)
         menu.addAction(self.act_move_down)
-        menu.exec(self.table.viewport().mapToGlobal(position))
+        menu.exec(self._active_table().viewport().mapToGlobal(position))
 
     def record_new_macro(self) -> None:
         options = RecordingOptions(
@@ -396,6 +478,8 @@ class MainWindow(QMainWindow):
         self.document = MacroDocument(name="Recorded Macro", recorded_environment=current_environment())
         self.current_path = None
         self.model.replace_actions(self.document.actions)
+        self.pre_action_model.replace_actions(self.document.pre_actions)
+        self._load_document_settings()
         self.undo_stack.clear()
         self.recording_hidden = hide_during_recording
         self.status.showMessage("Starting recording...")
@@ -496,29 +580,156 @@ class MainWindow(QMainWindow):
         self._run_from_index(0)
 
     def run_from_selected(self) -> None:
+        if self._active_model() is self.pre_action_model:
+            self._run_pre_actions_from_index(max(0, self._selected_row()))
+            return
         self._run_from_index(max(0, self._selected_row()))
 
-    def _run_from_index(self, row: int) -> None:
-        if not self.model.actions:
-            self.status.showMessage("No actions to run")
+    def _run_pre_actions_from_index(self, row: int) -> None:
+        if not self.pre_action_model.actions[row:]:
+            self.status.showMessage("No pre-actions to run")
             return
+        if self._playback_environment() is None:
+            return
+        countdown_seconds = int(self.settings.value("playback/countdown", 0))
+        self._start_countdown(countdown_seconds, "Pre-actions", lambda: self._start_pre_action_playback(row))
+
+    def _start_pre_action_playback(self, row: int) -> None:
+        pre_actions = list(self.pre_action_model.actions[row:])
+        iterations = sum(clamp_loop_count(action.loop_count) for action in pre_actions if action.enabled)
+        self.progress.setRange(0, max(1, iterations))
+        self.progress.setValue(0)
+        self.playback.play(
+            [],
+            pre_actions=pre_actions,
+            repeat_count=1,
+            speed=float(self.settings.value("playback/speed", self.document.settings.get("playback_speed", 1.0))),
+            recorded_environment=self.document.recorded_environment,
+            current_environment_snapshot=current_environment(),
+            coordinate_mode=str(self.document.settings.get("coordinate_mode", "exact")),
+        )
+        self._set_state(AppState.PLAYING)
+
+    def step_forward(self) -> None:
+        if self.state != AppState.IDLE or self.playback.running or self.recorder.running:
+            self.status.showMessage("Stop the active recording or playback before stepping")
+            return
+        steps = self._enabled_logical_steps()
+        step = step_at_or_after(steps, self._step_cursor)
+        if step is None:
+            self.status.showMessage("Reached the end of the macro")
+            return
+        playback_environment = self._playback_environment()
+        if playback_environment is None:
+            return
+
+        self._step_mode = True
+        self._step_active = step
+        self._step_pending_cursor = step.end
+        self._step_pending_image_found = self._step_context.get(step.start)
+        step_actions = self.model.actions[step.start : step.end]
+        step_iterations = sum(clamp_loop_count(action.loop_count) for action in step_actions if action.enabled)
+        self.progress.setRange(0, max(1, step_iterations))
+        self.progress.setValue(0)
+        speed = float(self.settings.value("playback/speed", self.document.settings.get("playback_speed", 1.0)))
+        coordinate_mode = str(self.document.settings.get("coordinate_mode", self.settings.value("playback/coordinate_mode", "exact")))
+        self.playback.play(
+            list(self.model.actions),
+            start_index=step.start,
+            end_index=step.end,
+            repeat_count=1,
+            speed=speed,
+            respect_action_delays=False,
+            initial_image_found=self._step_context.get(step.start),
+            recorded_environment=self.document.recorded_environment,
+            current_environment_snapshot=playback_environment,
+            coordinate_mode=coordinate_mode,
+        )
+        self._set_state(AppState.PLAYING)
+        self.status.showMessage(f"Testing action {step.start + 1}: {self.model.actions[step.start].description}")
+
+    def step_back(self) -> None:
+        if self.state != AppState.IDLE or self.playback.running or self.recorder.running:
+            self.status.showMessage("Stop the active recording or playback before moving the test cursor")
+            return
+        steps = self._enabled_logical_steps()
+        if not steps:
+            self.status.showMessage("No enabled actions to test")
+            return
+        if self._step_history:
+            target = step_at_or_after(steps, self._step_history.pop())
+        else:
+            target = step_before(steps, self._step_cursor)
+        if target is None:
+            self.status.showMessage("Already at the start of the macro")
+            return
+        self._step_cursor = target.start
+        self._step_pending_cursor = None
+        self._step_pending_image_found = self._step_context.get(target.start)
+        self._select_step_row(target.start)
+        self.model.set_playback_row(target.start)
+        self.status.showMessage(
+            f"Test cursor moved to action {target.start + 1}. Step Back does not undo actions already performed."
+        )
+
+    def _enabled_logical_steps(self) -> list[LogicalActionStep]:
+        return [
+            step
+            for step in logical_action_steps(self.model.actions)
+            if any(action.enabled for action in self.model.actions[step.start : step.end])
+        ]
+
+    def _select_step_row(self, row: int) -> None:
+        if not 0 <= row < len(self.model.actions):
+            return
+        self._updating_step_selection = True
+        try:
+            self.table.selectRow(row)
+            self.table.scrollTo(self.model.index(row, 0))
+        finally:
+            self._updating_step_selection = False
+
+    def _reset_step_session(self, cursor: int = 0) -> None:
+        self._step_cursor = min(max(0, cursor), len(self.model.actions))
+        self._step_mode = False
+        self._step_active = None
+        self._step_pending_cursor = None
+        self._step_pending_image_found = None
+        self._step_context = {self._step_cursor: None}
+        self._step_history.clear()
+
+    def _playback_environment(self):
         current = current_environment()
         if self.document.recorded_environment.monitors and len(self.document.recorded_environment.monitors) != len(current.monitors):
             dialog = MonitorWarningDialog(self.document.recorded_environment, current, self)
             if dialog.exec() != QDialog.DialogCode.Accepted:
-                return
+                return None
             self.document.settings["coordinate_mode"] = dialog.coordinate_mode
+        return current
+
+    def _run_from_index(self, row: int) -> None:
+        if not self.model.actions and not self.pre_action_model.actions:
+            self.status.showMessage("No actions to run")
+            return
+        if self._playback_environment() is None:
+            return
+        self._reset_step_session(row)
         countdown_seconds = int(self.settings.value("playback/countdown", 0))
         self._start_countdown(countdown_seconds, "Playback", lambda: self._start_playback(row))
 
     def _start_playback(self, row: int) -> None:
+        self._step_mode = False
         speed = float(self.settings.value("playback/speed", self.document.settings.get("playback_speed", 1.0)))
         coordinate_mode = str(self.document.settings.get("coordinate_mode", self.settings.value("playback/coordinate_mode", "exact")))
-        self.progress.setRange(0, max(1, len(self.model.actions) - row))
+        steps_per_loop = sum(clamp_loop_count(action.loop_count) for action in self.model.actions[row:] if action.enabled)
+        pre_action_steps = sum(clamp_loop_count(action.loop_count) for action in self.pre_action_model.actions if action.enabled)
+        self.progress.setRange(0, max(1, pre_action_steps + steps_per_loop * self.macro_loop_spin.value()))
         self.progress.setValue(0)
         self.playback.play(
             list(self.model.actions),
+            pre_actions=list(self.pre_action_model.actions),
             start_index=row,
+            repeat_count=self.macro_loop_spin.value(),
             speed=speed,
             recorded_environment=self.document.recorded_environment,
             current_environment_snapshot=current_environment(),
@@ -566,36 +777,73 @@ class MainWindow(QMainWindow):
         self.progress.setValue(min(self.progress.maximum(), self.progress.value() + 1))
         self.status.showMessage(action.description)
 
+    def _pre_action_progress(self, row: int, action: MacroAction) -> None:
+        self.pre_action_model.set_playback_row(row)
+        if 0 <= row < len(self.pre_action_model.actions):
+            self.pre_action_table.scrollTo(self.pre_action_model.index(row, 0))
+        self.progress.setValue(min(self.progress.maximum(), self.progress.value() + 1))
+        self.status.showMessage(f"Pre-action: {action.description}")
+
+    def _playback_context(self, next_index: int, image_found: bool | None) -> None:
+        if not self._step_mode:
+            return
+        self._step_pending_cursor = min(max(0, next_index), len(self.model.actions))
+        self._step_pending_image_found = image_found
+
     def _playback_finished(self, completed: bool, message: str) -> None:
-        self.model.set_playback_row(-1)
+        was_step = self._step_mode
+        active_step = self._step_active
+        if not was_step or not completed:
+            self.model.set_playback_row(-1)
+            self.pre_action_model.set_playback_row(-1)
         self.progress.setValue(0)
-        self.status.showMessage(message)
+        self._step_mode = False
+        self._step_active = None
+        if was_step and completed and active_step is not None:
+            self._step_history.append(active_step.start)
+            self._step_cursor = self._step_pending_cursor if self._step_pending_cursor is not None else active_step.end
+            self._step_context[self._step_cursor] = self._step_pending_image_found
         self._set_state(AppState.IDLE if completed else AppState.ERROR)
         if not completed:
             self._set_state(AppState.IDLE)
+            self.status.showMessage(message)
+            return
+        if was_step:
+            next_step = step_at_or_after(self._enabled_logical_steps(), self._step_cursor)
+            if next_step is None:
+                self.status.showMessage("Step complete. Reached the end of the macro.")
+            else:
+                self.status.showMessage(f"Step complete. Next is action {next_step.start + 1}.")
+            return
+        self.status.showMessage(message)
 
     def insert_action(self, action_type: ActionType) -> None:
+        active_model = self._active_model()
         row = self._selected_row()
-        target = row + 1 if row >= 0 else len(self.model.actions)
-        self.undo_stack.push(InsertActionCommand(self.model, target, create_action(action_type)))
+        target = row + 1 if row >= 0 else len(active_model.actions)
+        self.undo_stack.push(InsertActionCommand(active_model, target, create_action(action_type)))
 
     def delete_selected(self) -> None:
         rows = self._selected_rows()
         if rows:
-            self.undo_stack.push(DeleteActionsCommand(self.model, rows))
+            self.undo_stack.push(DeleteActionsCommand(self._active_model(), rows))
 
     def duplicate_selected(self) -> None:
         rows = self._selected_rows()
+        active_model = self._active_model()
         for row in rows:
-            self.undo_stack.push(InsertActionCommand(self.model, row + 1, self.model.actions[row].clone()))
+            self.undo_stack.push(InsertActionCommand(active_model, row + 1, active_model.actions[row].clone()))
 
     def move_selected(self, offset: int) -> None:
         row = self._selected_row()
         if row >= 0:
-            self.undo_stack.push(MoveActionCommand(self.model, row, offset))
+            self.undo_stack.push(MoveActionCommand(self._active_model(), row, offset))
 
     def _replace_action_from_properties(self, row: int, action: MacroAction) -> None:
-        self.undo_stack.push(ReplaceActionCommand(self.model, row, action))
+        active_model = self._active_model()
+        self.undo_stack.push(ReplaceActionCommand(active_model, row, action))
+        if active_model is self.model:
+            self._reset_step_session(row)
 
     def new_empty_macro(self) -> None:
         if not self._maybe_save():
@@ -603,6 +851,8 @@ class MainWindow(QMainWindow):
         self.document = MacroDocument(recorded_environment=current_environment())
         self.current_path = None
         self.model.replace_actions(self.document.actions)
+        self.pre_action_model.replace_actions(self.document.pre_actions)
+        self._load_document_settings()
         self.undo_stack.clear()
         self._update_title()
 
@@ -622,6 +872,8 @@ class MainWindow(QMainWindow):
             return
         self.current_path = path
         self.model.replace_actions(self.document.actions)
+        self.pre_action_model.replace_actions(self.document.pre_actions)
+        self._load_document_settings()
         self.undo_stack.clear()
         self._add_recent_file(path)
         self._update_title()
@@ -633,6 +885,7 @@ class MainWindow(QMainWindow):
         self._sync_document()
         self.current_path = save_macro(self.document, self.current_path)
         self.model.set_dirty(False)
+        self.pre_action_model.set_dirty(False)
         self._add_recent_file(self.current_path)
         self._update_title()
         self.status.showMessage(f"Saved {self.current_path.name}")
@@ -729,7 +982,7 @@ class MainWindow(QMainWindow):
             widget.update()
 
     def _maybe_save(self) -> bool:
-        if not self.model.dirty:
+        if not self.model.dirty and not self.pre_action_model.dirty:
             return True
         result = QMessageBox.question(
             self,
@@ -746,14 +999,25 @@ class MainWindow(QMainWindow):
 
     def _sync_document(self) -> None:
         self.document.actions = self.model.actions
+        self.document.pre_actions = self.pre_action_model.actions
         self.document.settings["playback_speed"] = float(self.settings.value("playback/speed", 1.0))
         self.document.settings["coordinate_mode"] = str(self.settings.value("playback/coordinate_mode", "exact"))
+        self.document.settings["macro_loop_count"] = self.macro_loop_spin.value()
+
+    def _load_document_settings(self) -> None:
+        self.macro_loop_spin.blockSignals(True)
+        self.macro_loop_spin.setValue(clamp_macro_loop_count(self.document.settings.get("macro_loop_count", 1)))
+        self.macro_loop_spin.blockSignals(False)
+
+    def _macro_loop_count_changed(self, value: int) -> None:
+        self.document.settings["macro_loop_count"] = clamp_macro_loop_count(value)
+        self.model.set_dirty(True)
 
     def _on_dirty_changed(self, dirty: bool) -> None:
         self._update_title()
 
     def _update_title(self) -> None:
-        marker = "*" if self.model.dirty else ""
+        marker = "*" if self.model.dirty or self.pre_action_model.dirty else ""
         name = self.current_path.name if self.current_path else self.document.name
         self.setWindowTitle(f"{marker}{name} - Macro Recorder +")
 
@@ -766,11 +1030,16 @@ class MainWindow(QMainWindow):
     def _refresh_controls(self, *args) -> None:
         is_idle = self.state == AppState.IDLE
         is_recording = self.state in {AppState.RECORDING, AppState.RECORDING_PAUSED}
+        has_enabled_actions = any(action.enabled for action in self.model.actions)
+        has_any_actions = bool(self.model.actions or self.pre_action_model.actions)
+        active_has_actions = bool(self._active_model().actions)
         self.act_new.setEnabled(True)
         self.act_open.setEnabled(is_idle)
         self.act_save.setEnabled(is_idle)
         self.act_run.setEnabled(True)
-        self.act_run_selected.setEnabled(is_idle and bool(self.model.actions))
+        self.act_run_selected.setEnabled(is_idle and active_has_actions)
+        self.act_step_back.setEnabled(is_idle and has_enabled_actions)
+        self.act_step_forward.setEnabled(is_idle and has_enabled_actions)
         self.act_pause_active.setEnabled(True)
         self.act_stop_active.setEnabled(True)
         self.act_pause_active.setText("Resume" if self.state in {AppState.RECORDING_PAUSED, AppState.PLAYBACK_PAUSED} else "Pause")
@@ -779,11 +1048,14 @@ class MainWindow(QMainWindow):
         else:
             self.record_button.setText("Stop Recording" if is_recording else "Record")
         self.run_button.setEnabled(True)
+        self.step_back_button.setEnabled(is_idle and has_enabled_actions)
+        self.step_forward_button.setEnabled(is_idle and has_enabled_actions)
+        self.macro_loop_spin.setEnabled(is_idle)
         self.pause_button.setText("Resume" if self.state in {AppState.RECORDING_PAUSED, AppState.PLAYBACK_PAUSED} else "Pause")
         self.stop_button.setText("Cancel" if self.state == AppState.COUNTING_DOWN else "Stop")
         self.stop_button.setEnabled(True)
-        self.act_export_py.setEnabled(is_idle and bool(self.model.actions))
-        self.act_export_exe.setEnabled(is_idle and bool(self.model.actions))
+        self.act_export_py.setEnabled(is_idle and has_any_actions)
+        self.act_export_exe.setEnabled(is_idle and has_any_actions)
         self.act_delete.setEnabled(is_idle)
         self.act_duplicate.setEnabled(is_idle)
 

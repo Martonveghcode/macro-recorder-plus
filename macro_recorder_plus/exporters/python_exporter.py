@@ -116,6 +116,100 @@ def set_dpi_awareness():
                 pass
 
 
+def current_virtual_desktop():
+    if sys.platform != "win32":
+        return {"left": 0, "top": 0, "right": 0, "bottom": 0}
+    user32 = ctypes.windll.user32
+    left = int(user32.GetSystemMetrics(76))
+    top = int(user32.GetSystemMetrics(77))
+    width = int(user32.GetSystemMetrics(78))
+    height = int(user32.GetSystemMetrics(79))
+    return {"left": left, "top": top, "right": left + width, "bottom": top + height}
+
+
+def rect_size(rect):
+    return (
+        max(0, int(rect.get("right", 0)) - int(rect.get("left", 0))),
+        max(0, int(rect.get("bottom", 0)) - int(rect.get("top", 0))),
+    )
+
+
+def clamp_point(x, y, bounds):
+    width, height = rect_size(bounds)
+    if width <= 0 or height <= 0:
+        return int(x), int(y)
+    left = int(bounds.get("left", 0))
+    top = int(bounds.get("top", 0))
+    return (
+        min(max(int(x), left), left + width - 1),
+        min(max(int(y), top), top + height - 1),
+    )
+
+
+def transform_point(x, y, recorded_environment, current_bounds, mode="exact"):
+    recorded_bounds = recorded_environment.get("virtual_desktop", {})
+    recorded_width, recorded_height = rect_size(recorded_bounds)
+    current_width, current_height = rect_size(current_bounds)
+    if str(mode) == "exact" or recorded_width <= 0 or current_width <= 0:
+        return clamp_point(x, y, current_bounds)
+    recorded_left = int(recorded_bounds.get("left", 0))
+    recorded_top = int(recorded_bounds.get("top", 0))
+    current_left = int(current_bounds.get("left", 0))
+    current_top = int(current_bounds.get("top", 0))
+    relative_x = (int(x) - recorded_left) / max(1, recorded_width)
+    relative_y = (int(y) - recorded_top) / max(1, recorded_height)
+    transformed_x = current_left + round(relative_x * current_width)
+    transformed_y = current_top + round(relative_y * current_height)
+    return clamp_point(transformed_x, transformed_y, current_bounds)
+
+
+def transform_action_coordinates(action, recorded_environment, current_bounds, coordinate_mode):
+    action_type = action.get("type")
+    if action_type not in {"mouse_move", "mouse_button", "scroll"}:
+        return action
+    transformed = dict(action)
+    params = dict(action.get("params", {}))
+    if action_type == "mouse_move":
+        for key in ("start", "end"):
+            point = params.get(key)
+            if point:
+                params[key] = list(
+                    transform_point(point[0], point[1], recorded_environment, current_bounds, coordinate_mode)
+                )
+        if params.get("path"):
+            params["path"] = [
+                [
+                    *transform_point(point[0], point[1], recorded_environment, current_bounds, coordinate_mode),
+                    point[2],
+                ]
+                for point in params["path"]
+                if len(point) >= 3
+            ]
+    elif "x" in params and "y" in params:
+        params["x"], params["y"] = transform_point(
+            params["x"], params["y"], recorded_environment, current_bounds, coordinate_mode
+        )
+    transformed["params"] = params
+    return transformed
+
+
+def position_mouse(mouse_controller, x, y, attempts=3, tolerance=1):
+    target = (int(x), int(y))
+    last_position = None
+    for attempt in range(max(1, int(attempts))):
+        mouse_controller.position = target
+        actual = getattr(mouse_controller, "position", target)
+        try:
+            last_position = (int(actual[0]), int(actual[1]))
+        except (TypeError, ValueError, IndexError):
+            last_position = target
+        if abs(last_position[0] - target[0]) <= tolerance and abs(last_position[1] - target[1]) <= tolerance:
+            return target
+        if attempt + 1 < attempts:
+            time.sleep(0.001)
+    raise RuntimeError(f"Mouse did not reach ({target[0]}, {target[1]}); Windows reported {last_position}")
+
+
 def install_dependencies():
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
     LOCAL_DEPS.mkdir(parents=True, exist_ok=True)
@@ -157,6 +251,8 @@ def key_from_name(name, keyboard):
         "escape": keyboard.Key.esc,
         "backspace": keyboard.Key.backspace,
         "delete": keyboard.Key.delete,
+        "home": keyboard.Key.home,
+        "end": keyboard.Key.end,
         "tab": keyboard.Key.tab,
         "space": keyboard.Key.space,
         "left": keyboard.Key.left,
@@ -165,7 +261,11 @@ def key_from_name(name, keyboard):
         "down": keyboard.Key.down,
     }
     key = str(name).lower().replace("key.", "")
-    return lookup.get(key) or keyboard.KeyCode.from_char(key)
+    if key in lookup:
+        return lookup[key]
+    if key.startswith("f") and key[1:].isdigit():
+        return getattr(keyboard.Key, key)
+    return keyboard.KeyCode.from_char(key)
 
 
 def button_from_name(name, mouse):
@@ -209,15 +309,15 @@ def resolve_file_path(file_path):
     return SCRIPT_DIR / path
 
 
-def open_file_with_default_app(file_path, *, target_monitor="default", auto_focus=False, timeout=10.0):
+def open_file_with_default_app(file_path, *, target_monitor="default", auto_focus=False, timeout=10.0, window_placement=None):
     path = resolve_file_path(file_path)
     if not path.exists() or not path.is_file():
         raise FileNotFoundError(f"File not found: {path}")
     if sys.platform == "win32":
-        if auto_focus or target_monitor != "default":
+        if auto_focus or target_monitor != "default" or window_placement:
             pid = shell_execute_file_with_process_id(path)
             if pid is not None:
-                arrange_process_window(pid, target_monitor=target_monitor, auto_focus=auto_focus, timeout=timeout)
+                arrange_process_window(pid, target_monitor=target_monitor, auto_focus=auto_focus, timeout=timeout, window_placement=window_placement)
                 return
         os.startfile(str(path))
     elif sys.platform == "darwin":
@@ -262,7 +362,7 @@ def shell_execute_file_with_process_id(path):
         kernel32.CloseHandle(info.hProcess)
 
 
-def arrange_process_window(process_id, *, target_monitor="default", auto_focus=False, timeout=10.0):
+def arrange_process_window(process_id, *, target_monitor="default", auto_focus=False, timeout=10.0, window_placement=None):
     if sys.platform != "win32" or not process_id:
         return False
     hwnd = find_top_level_window_for_process(int(process_id), timeout=max(0.0, timeout))
@@ -270,9 +370,12 @@ def arrange_process_window(process_id, *, target_monitor="default", auto_focus=F
         return False
     user32 = ctypes.windll.user32
     user32.ShowWindow(hwnd, 9)
-    monitor = select_target_monitor(target_monitor)
-    if monitor is not None:
-        move_window_to_monitor(hwnd, monitor)
+    if window_placement:
+        restore_window_placement(hwnd, window_placement)
+    else:
+        monitor = select_target_monitor(target_monitor)
+        if monitor is not None:
+            move_window_to_monitor(hwnd, monitor)
     if auto_focus:
         user32.BringWindowToTop(hwnd)
         user32.SetForegroundWindow(hwnd)
@@ -307,6 +410,84 @@ def find_top_level_window_for_process(process_id, *, timeout):
         if time.perf_counter() >= deadline:
             return None
         time.sleep(0.05)
+
+
+def process_executable_path(process_id):
+    kernel32 = ctypes.windll.kernel32
+    handle = kernel32.OpenProcess(0x1000, False, process_id)
+    if not handle:
+        return ""
+    try:
+        size = ctypes.c_ulong(32768)
+        buffer = ctypes.create_unicode_buffer(size.value)
+        if kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
+            return buffer.value
+        return ""
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def find_top_level_window_for_executable(executable, *, timeout=10.0, title_hint=""):
+    if sys.platform != "win32" or not executable:
+        return None
+    expected = str(executable).casefold()
+    user32 = ctypes.windll.user32
+    enum_proc_type = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+    deadline = time.perf_counter() + max(0.0, timeout)
+    while True:
+        found = []
+
+        def callback(hwnd, lparam):
+            if not user32.IsWindowVisible(hwnd) or user32.GetWindow(hwnd, 4):
+                return True
+            window_pid = ctypes.c_ulong()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(window_pid))
+            if process_executable_path(int(window_pid.value)).casefold() != expected:
+                return True
+            length = int(user32.GetWindowTextLengthW(hwnd))
+            title_buffer = ctypes.create_unicode_buffer(length + 1)
+            user32.GetWindowTextW(hwnd, title_buffer, length + 1)
+            found.append((int(hwnd), title_buffer.value))
+            return True
+
+        user32.EnumWindows(enum_proc_type(callback), 0)
+        if found:
+            hint = str(title_hint).casefold().strip()
+            if hint:
+                exact = next((hwnd for hwnd, title in found if title.casefold() == hint), None)
+                if exact is not None:
+                    return exact
+                hinted = next(
+                    (
+                        hwnd
+                        for hwnd, title in found
+                        if hint in title.casefold() or title.casefold() in hint
+                    ),
+                    None,
+                )
+                if hinted is not None:
+                    return hinted
+            return found[0][0]
+        if time.perf_counter() >= deadline:
+            return None
+        time.sleep(0.05)
+
+
+def arrange_existing_window(placement, *, auto_focus=False, timeout=10.0):
+    hwnd = find_top_level_window_for_executable(
+        placement.get("process_path", ""),
+        timeout=timeout,
+        title_hint=placement.get("window_title", ""),
+    )
+    if not hwnd:
+        return False
+    user32 = ctypes.windll.user32
+    user32.ShowWindow(hwnd, 9)
+    restore_window_placement(hwnd, placement)
+    if auto_focus:
+        user32.BringWindowToTop(hwnd)
+        user32.SetForegroundWindow(hwnd)
+    return True
 
 
 def select_target_monitor(target_monitor):
@@ -351,6 +532,7 @@ def windows_monitors():
                 {
                     "work": (info.rcWork.left, info.rcWork.top, info.rcWork.right, info.rcWork.bottom),
                     "primary": bool(info.dwFlags & 1),
+                    "identifier": info.szDevice,
                 }
             )
         return 1
@@ -375,6 +557,35 @@ def move_window_to_monitor(hwnd, monitor):
     x = int(left) + max(0, (work_width - width) // 2)
     y = int(top) + max(0, (work_height - height) // 2)
     user32.SetWindowPos(hwnd, 0, x, y, width, height, 0x0004)
+
+
+def restore_window_placement(hwnd, placement):
+    monitors = windows_monitors()
+    monitor = next(
+        (item for item in monitors if item.get("identifier") == placement.get("monitor_identifier")),
+        None,
+    )
+    if monitor is None:
+        try:
+            index = int(placement.get("monitor_index", -1))
+        except (TypeError, ValueError):
+            index = -1
+        if 0 <= index < len(monitors):
+            monitor = monitors[index]
+    width = max(1, int(placement.get("width", 1) or 1))
+    height = max(1, int(placement.get("height", 1) or 1))
+    if monitor is not None:
+        left, top, right, bottom = monitor["work"]
+        width = min(width, max(1, right - left))
+        height = min(height, max(1, bottom - top))
+        x = min(max(left + int(placement.get("offset_x", 0) or 0), left), right - width)
+        y = min(max(top + int(placement.get("offset_y", 0) or 0), top), bottom - height)
+    else:
+        x = int(placement.get("x", 0) or 0)
+        y = int(placement.get("y", 0) or 0)
+    ctypes.windll.user32.SetWindowPos(hwnd, 0, x, y, width, height, 0x0004)
+    if placement.get("maximized"):
+        ctypes.windll.user32.ShowWindow(hwnd, 3)
 
 
 def region_from_params(params):
@@ -552,7 +763,7 @@ def best_sampled_candidates(screen_array, template_array, candidate_rows, candid
     return candidate_rows[best_indexes], candidate_cols[best_indexes]
 
 
-def execute_image_click(params, mouse_controller, mouse, stop_event=None):
+def execute_image_click(params, mouse_controller, mouse, stop_event=None, held_buttons=None, speed=1.0):
     match = find_image_on_screen(params, stop_event=stop_event)
     if match is None:
         if stop_event is not None and stop_event.is_set():
@@ -562,10 +773,13 @@ def execute_image_click(params, mouse_controller, mouse, stop_event=None):
             return False
         raise RuntimeError(f"Image not found on screen: {params.get('image_path', '')}")
 
-    mouse_controller.position = match["center"]
+    position_mouse(mouse_controller, *match["center"])
     click_action = str(params.get("click_action", "left_click"))
     if click_action == "move_only":
         return True
+    if click_action == "custom_movement":
+        execute_image_movement(params, match, mouse_controller, mouse, stop_event=stop_event, held_buttons=held_buttons, speed=speed)
+        return None if stop_event is not None and stop_event.is_set() else True
     if click_action == "double_click":
         button = button_from_name("left", mouse)
         for _ in range(2):
@@ -578,6 +792,89 @@ def execute_image_click(params, mouse_controller, mouse, stop_event=None):
     mouse_controller.press(button)
     mouse_controller.release(button)
     return True
+
+
+def execute_image_movement(params, match, mouse_controller, mouse, stop_event=None, held_buttons=None, speed=1.0):
+    points = image_movement_points(params, match)
+    if not points:
+        return
+    interpolated_points = interpolated_mouse_points(points)
+    if not interpolated_points:
+        return
+    first_x, first_y, _ = interpolated_points[0]
+    position_mouse(mouse_controller, first_x, first_y)
+    apply_image_movement_button(params, mouse_controller, mouse, "start", held_buttons)
+    start_time = time.perf_counter()
+    for x, y, relative_time in interpolated_points[1:]:
+        target = start_time + (relative_time / max(0.01, speed))
+        if stop_event is not None:
+            if not sleep_until(target, stop_event):
+                return
+        else:
+            remaining = target - time.perf_counter()
+            if remaining > 0:
+                time.sleep(remaining)
+        position_mouse(mouse_controller, x, y)
+    apply_image_movement_button(params, mouse_controller, mouse, "end", held_buttons)
+
+
+def image_movement_points(params, match):
+    center_x, center_y = match["center"]
+    points = []
+    for point in params.get("movement_path", []) or []:
+        if len(point) >= 3:
+            points.append((center_x + int(point[0]), center_y + int(point[1]), max(0.0, float(point[2]))))
+    if points:
+        return points
+    start_offset = offset_pair(params.get("movement_start_offset", [0, 0]))
+    end_offset = offset_pair(params.get("movement_end_offset", [0, 0]))
+    duration = max(0.0, float(params.get("movement_duration", 0.0)))
+    return [
+        (center_x + start_offset[0], center_y + start_offset[1], 0.0),
+        (center_x + end_offset[0], center_y + end_offset[1], duration),
+    ]
+
+
+def offset_pair(value):
+    if not isinstance(value, (list, tuple)) or len(value) < 2:
+        return (0, 0)
+    return (int(value[0]), int(value[1]))
+
+
+def apply_image_movement_button(params, mouse_controller, mouse, stage, held_buttons=None):
+    button_action = str(params.get("movement_button_action", "none"))
+    if button_action == "none":
+        return
+    button = button_from_name(params.get("movement_button", "left"), mouse)
+    if stage == "start":
+        if button_action == "click_at_start":
+            click_mouse_button(mouse_controller, button)
+        elif button_action == "double_click_at_start":
+            double_click_mouse_button(mouse_controller, button)
+        elif button_action in {"hold_during_move", "press_at_start"}:
+            mouse_controller.press(button)
+            if held_buttons is not None:
+                held_buttons.append(button)
+    elif stage == "end":
+        if button_action == "click_at_end":
+            click_mouse_button(mouse_controller, button)
+        elif button_action == "double_click_at_end":
+            double_click_mouse_button(mouse_controller, button)
+        elif button_action in {"hold_during_move", "release_at_end"}:
+            mouse_controller.release(button)
+            if held_buttons is not None:
+                held_buttons[:] = [held for held in held_buttons if held != button]
+
+
+def click_mouse_button(mouse_controller, button):
+    mouse_controller.press(button)
+    mouse_controller.release(button)
+
+
+def double_click_mouse_button(mouse_controller, button):
+    for _ in range(2):
+        click_mouse_button(mouse_controller, button)
+        time.sleep(0.05)
 
 
 def conditional_jump_target(params, runtime_state, action_count):
@@ -626,11 +923,21 @@ def sleep_until(target, stop_event):
         time.sleep(min(remaining, 0.005))
 
 
+def clamp_loop_count(value):
+    try:
+        count = int(value)
+    except (TypeError, ValueError):
+        count = 1
+    return min(99999, max(1, count))
+
+
 def main():
     parser = argparse.ArgumentParser(description="Run an exported Macro Recorder + macro.")
-    parser.add_argument("--speed", type=float, default=1.0)
+    parser.add_argument("--speed", type=float, default=None, help="Override the saved playback speed.")
+    parser.add_argument("--loops", type=int, default=None, help="Override the saved whole-macro loop count.")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--start-action", type=int, default=0)
+    parser.add_argument("--end-action", type=int, default=None, help="Stop before this zero-based action index.")
     parser.add_argument("--install-deps", action="store_true", help="Install runtime dependencies into the local export folder.")
     parser.add_argument("--no-hotkey", action="store_true", help="Disable the F10 emergency-stop listener.")
     args = parser.parse_args()
@@ -639,7 +946,13 @@ def main():
         return install_dependencies()
 
     set_dpi_awareness()
-    speed = max(0.01, args.speed)
+    speed = max(
+        0.01,
+        float(args.speed if args.speed is not None else MACRO.get("settings", {}).get("playback_speed", 1.0)),
+    )
+    recorded_environment = MACRO.get("recorded_environment", {})
+    current_bounds = current_virtual_desktop()
+    coordinate_mode = str(MACRO.get("settings", {}).get("coordinate_mode", "exact"))
     stop_event = threading.Event()
     hotkey_listener = None
     held_keys = []
@@ -678,11 +991,62 @@ def main():
         held_keys.clear()
         held_buttons.clear()
 
+    def begin_macro_loop():
+        release_all()
+        if args.dry_run or mouse_controller is None:
+            return
+        cursor_start = recorded_environment.get("cursor_start")
+        if cursor_start:
+            x, y = transform_point(
+                cursor_start[0],
+                cursor_start[1],
+                recorded_environment,
+                current_bounds,
+                coordinate_mode,
+            )
+            position_mouse(mouse_controller, x, y)
+
     try:
-        actions = MACRO["actions"]
+        main_actions = MACRO["actions"]
+        pre_actions = MACRO.get("pre_actions", [])
         runtime_state = {"last_image_found": None}
-        index = max(0, args.start_action)
-        while index < len(actions):
+        main_start_index = max(0, args.start_action)
+        main_end_index = (
+            len(main_actions)
+            if args.end_action is None
+            else min(len(main_actions), max(main_start_index, args.end_action))
+        )
+        running_pre_actions = bool(pre_actions)
+        actions = pre_actions if running_pre_actions else main_actions
+        start_index = 0 if running_pre_actions else main_start_index
+        macro_loop_count = clamp_loop_count(
+            args.loops if args.loops is not None else MACRO.get("settings", {}).get("macro_loop_count", 1)
+        )
+        macro_loop_index = -1 if running_pre_actions else 0
+        loop_needs_initialization = not running_pre_actions
+        index = start_index
+        while macro_loop_index < macro_loop_count:
+            end_index = len(actions) if running_pre_actions else main_end_index
+            if index >= end_index:
+                if running_pre_actions:
+                    running_pre_actions = False
+                    actions = main_actions
+                    start_index = main_start_index
+                    runtime_state["last_image_found"] = None
+                    macro_loop_index = 0
+                    loop_needs_initialization = True
+                    index = start_index
+                    continue
+                macro_loop_index += 1
+                if macro_loop_index >= macro_loop_count:
+                    break
+                runtime_state["last_image_found"] = None
+                loop_needs_initialization = True
+                index = start_index
+                continue
+            if loop_needs_initialization:
+                begin_macro_loop()
+                loop_needs_initialization = False
             action = actions[index]
             next_index = index + 1
             if stop_event.is_set():
@@ -693,110 +1057,128 @@ def main():
                     runtime_state["last_image_found"] = None
                 index = next_index
                 continue
-            delay = max(0.0, float(action.get("delay", 0.0))) / speed
-            if delay and not args.dry_run:
-                if not sleep_until(time.perf_counter() + delay, stop_event):
+            for _loop_index in range(clamp_loop_count(action.get("loop_count", 1))):
+                if stop_event.is_set():
                     print("Emergency stop requested", file=sys.stderr)
                     return 130
-            print(f"{index}: {action['type']} {action.get('label') or action.get('params', '')}")
-            if args.dry_run:
-                index = next_index
-                continue
-
-            params = action.get("params", {})
-            action_type = action["type"]
-            if action_type == "wait":
-                seconds = float(params.get("seconds", action.get("duration", 0))) / speed
-                if not sleep_until(time.perf_counter() + seconds, stop_event):
-                    print("Emergency stop requested", file=sys.stderr)
-                    return 130
-            elif action_type == "open_url":
-                webbrowser.open(params["url"])
-            elif action_type == "open_file":
-                open_file_with_default_app(
-                    params.get("file_path", ""),
-                    target_monitor=params.get("target_monitor", "default"),
-                    auto_focus=bool(params.get("auto_focus", False)),
-                )
-            elif action_type == "launch_program":
-                command = [params["executable"]]
-                if params.get("arguments"):
-                    command.append(params["arguments"])
-                process = subprocess.Popen(command, cwd=params.get("working_directory") or None)
-                target_monitor = params.get("target_monitor", "default")
-                auto_focus = bool(params.get("auto_focus", False))
-                wait_for_startup = bool(params.get("wait_for_startup", False))
-                if wait_for_startup or auto_focus or target_monitor != "default":
-                    arrange_process_window(
-                        process.pid,
-                        target_monitor=target_monitor,
-                        auto_focus=auto_focus,
-                        timeout=float(params.get("startup_timeout", 10.0)),
-                    )
-            elif action_type == "type_text":
-                keyboard_controller.type(params.get("text", ""))
-            elif action_type == "type_secret":
-                env_name = params["environment_variable"]
-                secret = os.environ.get(env_name)
-                if secret is None and sys.stdin.isatty():
-                    secret = getpass(f"{env_name}: ")
-                if secret is None:
-                    raise RuntimeError(f"Missing environment variable {env_name}")
-                keyboard_controller.type(secret)
-            elif action_type == "key_press":
-                key = key_from_name(params.get("key", ""), keyboard)
-                phase = params.get("phase", "press_release")
-                if phase == "press":
-                    keyboard_controller.press(key)
-                    held_keys.append(key)
-                elif phase == "release":
-                    keyboard_controller.release(key)
-                    held_keys = [held for held in held_keys if held != key]
-                else:
-                    keyboard_controller.press(key)
-                    keyboard_controller.release(key)
-            elif action_type == "hotkey":
-                keys = [key_from_name(key, keyboard) for key in params.get("keys", [])]
-                for key in keys:
-                    keyboard_controller.press(key)
-                    held_keys.append(key)
-                for key in reversed(keys):
-                    keyboard_controller.release(key)
-                    held_keys.pop()
-            elif action_type == "mouse_move":
-                start_time = time.perf_counter()
-                for x, y, relative_time in interpolated_mouse_points(mouse_move_points(action)):
-                    if not sleep_until(start_time + (relative_time / speed), stop_event):
+                delay = max(0.0, float(action.get("delay", 0.0))) / speed
+                if delay and not args.dry_run:
+                    if not sleep_until(time.perf_counter() + delay, stop_event):
                         print("Emergency stop requested", file=sys.stderr)
                         return 130
-                    mouse_controller.position = (int(x), int(y))
-            elif action_type == "mouse_button":
-                mouse_controller.position = (int(params.get("x", 0)), int(params.get("y", 0)))
-                button = button_from_name(params.get("button", "left"), mouse)
-                phase = params.get("phase", "click")
-                if phase == "press":
-                    mouse_controller.press(button)
-                    held_buttons.append(button)
-                elif phase == "release":
-                    mouse_controller.release(button)
-                    held_buttons = [held for held in held_buttons if held != button]
-                else:
-                    mouse_controller.press(button)
-                    mouse_controller.release(button)
-            elif action_type == "scroll":
-                mouse_controller.position = (int(params.get("x", 0)), int(params.get("y", 0)))
-                mouse_controller.scroll(int(params.get("dx", 0)), int(params.get("dy", 0)))
-            elif action_type == "image_click":
-                image_found = execute_image_click(params, mouse_controller, mouse, stop_event)
-                if image_found is None:
-                    print("Emergency stop requested", file=sys.stderr)
-                    return 130
-                runtime_state["last_image_found"] = bool(image_found)
-            elif action_type == "if_condition":
-                jump_index = conditional_jump_target(params, runtime_state, len(actions))
-                if jump_index is not None:
-                    print(f"If Image Result jumped to action {jump_index + 1}")
-                    next_index = jump_index
+                print(f"{index}: {action['type']} {action.get('label') or action.get('params', '')}")
+                if args.dry_run:
+                    continue
+
+                runtime_action = transform_action_coordinates(
+                    action,
+                    recorded_environment,
+                    current_bounds,
+                    coordinate_mode,
+                )
+                params = runtime_action.get("params", {})
+                action_type = runtime_action["type"]
+                if action_type == "wait":
+                    seconds = float(params.get("seconds", action.get("duration", 0))) / speed
+                    if not sleep_until(time.perf_counter() + seconds, stop_event):
+                        print("Emergency stop requested", file=sys.stderr)
+                        return 130
+                elif action_type == "open_url":
+                    webbrowser.open(params["url"])
+                    if params.get("window_placement"):
+                        arrange_existing_window(
+                            params["window_placement"],
+                            auto_focus=bool(params.get("auto_focus", False)),
+                        )
+                elif action_type == "open_file":
+                    open_file_with_default_app(
+                        params.get("file_path", ""),
+                        target_monitor=params.get("target_monitor", "default"),
+                        auto_focus=bool(params.get("auto_focus", False)),
+                        window_placement=params.get("window_placement"),
+                    )
+                elif action_type == "launch_program":
+                    command = [params["executable"]]
+                    if params.get("arguments"):
+                        command.append(params["arguments"])
+                    process = subprocess.Popen(command, cwd=params.get("working_directory") or None)
+                    target_monitor = params.get("target_monitor", "default")
+                    auto_focus = bool(params.get("auto_focus", False))
+                    wait_for_startup = bool(params.get("wait_for_startup", False))
+                    window_placement = params.get("window_placement")
+                    if wait_for_startup or auto_focus or target_monitor != "default" or window_placement:
+                        arrange_process_window(
+                            process.pid,
+                            target_monitor=target_monitor,
+                            auto_focus=auto_focus,
+                            timeout=float(params.get("startup_timeout", 10.0)),
+                            window_placement=window_placement,
+                        )
+                elif action_type == "type_text":
+                    keyboard_controller.type(params.get("text", ""))
+                elif action_type == "type_secret":
+                    env_name = params["environment_variable"]
+                    secret = os.environ.get(env_name)
+                    if secret is None and sys.stdin.isatty():
+                        secret = getpass(f"{env_name}: ")
+                    if secret is None:
+                        raise RuntimeError(f"Missing environment variable {env_name}")
+                    keyboard_controller.type(secret)
+                elif action_type == "key_press":
+                    key = key_from_name(params.get("key", ""), keyboard)
+                    phase = params.get("phase", "press_release")
+                    if phase == "press":
+                        keyboard_controller.press(key)
+                        held_keys.append(key)
+                    elif phase == "release":
+                        keyboard_controller.release(key)
+                        held_keys = [held for held in held_keys if held != key]
+                    else:
+                        keyboard_controller.press(key)
+                        keyboard_controller.release(key)
+                elif action_type == "hotkey":
+                    keys = [key_from_name(key, keyboard) for key in params.get("keys", [])]
+                    for key in keys:
+                        keyboard_controller.press(key)
+                        held_keys.append(key)
+                    for key in reversed(keys):
+                        keyboard_controller.release(key)
+                        held_keys.pop()
+                elif action_type == "mouse_move":
+                    start_time = time.perf_counter()
+                    for x, y, relative_time in interpolated_mouse_points(mouse_move_points(runtime_action)):
+                        if not sleep_until(start_time + (relative_time / speed), stop_event):
+                            print("Emergency stop requested", file=sys.stderr)
+                            return 130
+                        position_mouse(mouse_controller, x, y)
+                elif action_type == "mouse_button":
+                    position_mouse(mouse_controller, params.get("x", 0), params.get("y", 0))
+                    button = button_from_name(params.get("button", "left"), mouse)
+                    phase = params.get("phase", "click")
+                    if phase == "press":
+                        mouse_controller.press(button)
+                        held_buttons.append(button)
+                    elif phase == "release":
+                        mouse_controller.release(button)
+                        held_buttons = [held for held in held_buttons if held != button]
+                    else:
+                        mouse_controller.press(button)
+                        mouse_controller.release(button)
+                elif action_type == "scroll":
+                    position_mouse(mouse_controller, params.get("x", 0), params.get("y", 0))
+                    mouse_controller.scroll(int(params.get("dx", 0)), int(params.get("dy", 0)))
+                elif action_type == "image_click":
+                    image_found = execute_image_click(params, mouse_controller, mouse, stop_event, held_buttons, speed)
+                    if image_found is None:
+                        print("Emergency stop requested", file=sys.stderr)
+                        return 130
+                    runtime_state["last_image_found"] = bool(image_found)
+                elif action_type == "if_condition":
+                    jump_index = conditional_jump_target(params, runtime_state, len(actions))
+                    if jump_index is not None:
+                        print(f"If Image Result jumped to action {jump_index + 1}")
+                        next_index = jump_index
+                        break
             index = next_index
         return 0
     except KeyboardInterrupt:
@@ -838,7 +1220,7 @@ if __name__ == "__main__":
     def _document_with_export_assets(self, document: MacroDocument, target: Path) -> MacroDocument:
         export_document = MacroDocument.from_dict(document.to_dict())
         asset_dir = target.parent / ASSETS_DIR_NAME
-        for action in export_document.actions:
+        for action in [*export_document.pre_actions, *export_document.actions]:
             if action.type != ActionType.IMAGE_CLICK:
                 continue
             image_path = str(action.params.get("image_path", ""))

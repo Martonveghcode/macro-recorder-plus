@@ -16,11 +16,17 @@ Macro files are UTF-8 JSON documents. The default extension is `.mrplus.json`.
   },
   "settings": {
     "playback_speed": 1.0,
+    "macro_loop_count": 1,
     "coordinate_mode": "exact"
   },
+  "pre_actions": [],
   "actions": []
 }
 ```
+
+`settings.macro_loop_count` repeats the complete macro during GUI playback and in exported runners. It defaults to `1` and is clamped to `1` through `99999`.
+
+`pre_actions` uses the same action objects as `actions`, but runs once at the start of playback before the main action loop. Missing `pre_actions` in older files defaults to an empty list.
 
 Each action contains:
 
@@ -30,6 +36,7 @@ Each action contains:
 - `delay`: seconds to wait after the previous action.
 - `timestamp`: relative timestamp from recording start.
 - `duration`: action duration where relevant.
+- `loop_count`: how many times playback repeats this action before advancing. Values are clamped to `1` through `99999`.
 - `label`: optional human-readable label.
 - `params`: action-specific parameters.
 
@@ -59,12 +66,15 @@ Open file actions store a file path and open it with the operating system's defa
   "params": {
     "file_path": "C:\\Users\\marto\\Documents\\notes.pdf",
     "target_monitor": "default",
-    "auto_focus": false
+    "auto_focus": false,
+    "window_placement": null
   }
 }
 ```
 
 `target_monitor` can be `default`, `primary`, or a 1-based monitor number as a string such as `"1"` or `"2"`. When `auto_focus` is true, Windows playback tries to bring the opened file or launched program window to the foreground after it appears.
+
+When captured in the editor, `window_placement` stores the window's bounds, monitor identifier and index, monitor-relative offset, and maximized state. A saved placement takes precedence over the simpler centered `target_monitor` behavior.
 
 Launch program actions support the same window-placement fields:
 
@@ -101,7 +111,13 @@ Image click actions store the path to a screenshot or image template plus detect
     "region_x": 0,
     "region_y": 0,
     "region_width": 0,
-    "region_height": 0
+    "region_height": 0,
+    "movement_start_offset": [0, 0],
+    "movement_end_offset": [0, 0],
+    "movement_duration": 0.5,
+    "movement_button": "left",
+    "movement_button_action": "none",
+    "movement_path": []
   }
 }
 ```
@@ -109,6 +125,8 @@ Image click actions store the path to a screenshot or image template plus detect
 When exported as Python, referenced image files are copied into `macro_recorder_plus_assets` and the exported script uses the copied relative path.
 
 `checks_per_second` controls how often the screen is checked while `wait_until_found` is enabled. A `timeout` of `0` means keep waiting until the image appears or playback is stopped. `poll_interval` is still read for older macro files.
+
+Set `click_action` to `custom_movement` to move relative to the matched image center instead of clicking the center. `movement_start_offset` and `movement_end_offset` are `[x, y]` pixel offsets from the image center, `movement_duration` is seconds, and `movement_button_action` can be `none`, `click_at_start`, `click_at_end`, `double_click_at_start`, `double_click_at_end`, `hold_during_move`, `press_at_start`, or `release_at_end`.
 
 Conditional image-result actions branch from the previous image click result:
 

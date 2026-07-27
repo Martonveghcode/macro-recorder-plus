@@ -13,6 +13,7 @@ def test_action_properties_emits_typed_wait_params(qtbot):
     action = create_action(ActionType.WAIT)
     widget.set_action(0, action)
 
+    widget.loop_spin.setValue(4)
     widget.param_widgets["seconds"].setValue(2.25)
 
     with qtbot.waitSignal(widget.actionChanged, timeout=1000) as blocker:
@@ -20,6 +21,7 @@ def test_action_properties_emits_typed_wait_params(qtbot):
 
     row, updated = blocker.args
     assert row == 0
+    assert updated.loop_count == 4
     assert updated.params["seconds"] == 2.25
     assert updated.duration == 2.25
 
@@ -33,6 +35,9 @@ def test_action_properties_emits_image_wait_frequency_params(qtbot):
     widget.param_widgets["wait_until_found"].setChecked(True)
     widget.param_widgets["timeout"].setValue(0.0)
     widget.param_widgets["checks_per_second"].setValue(8.0)
+    widget.param_widgets["verification_attempts"].setValue(3)
+    widget.param_widgets["stable_match_pixels"].setValue(12)
+    widget.param_widgets["scale_tolerance"].setValue(0.08)
 
     with qtbot.waitSignal(widget.actionChanged, timeout=1000) as blocker:
         widget.apply_button.click()
@@ -43,6 +48,51 @@ def test_action_properties_emits_image_wait_frequency_params(qtbot):
     assert updated.params["timeout"] == 0.0
     assert updated.params["checks_per_second"] == 8.0
     assert updated.params["poll_interval"] == 0.125
+    assert updated.params["verification_attempts"] == 3
+    assert updated.params["stable_match_pixels"] == 12
+    assert updated.params["scale_tolerance"] == 0.08
+
+
+def test_action_properties_region_picker_updates_region_fields(qtbot):
+    widget = ActionProperties()
+    qtbot.addWidget(widget)
+    widget.set_action(0, create_action(ActionType.IMAGE_CLICK))
+
+    widget._set_image_region(100, 200, 320, 180)
+
+    assert widget.param_widgets["region_x"].value() == 100
+    assert widget.param_widgets["region_y"].value() == 200
+    assert widget.param_widgets["region_width"].value() == 320
+    assert widget.param_widgets["region_height"].value() == 180
+
+
+
+def test_action_properties_emits_image_custom_movement_params(qtbot):
+    widget = ActionProperties()
+    qtbot.addWidget(widget)
+    action = create_action(ActionType.IMAGE_CLICK)
+    widget.set_action(0, action)
+
+    widget.param_widgets["click_action"].setCurrentIndex(widget.param_widgets["click_action"].findText("custom_movement"))
+    widget.param_widgets["movement_start_offset_x"].setValue(5)
+    widget.param_widgets["movement_start_offset_y"].setValue(-2)
+    widget.param_widgets["movement_end_offset_x"].setValue(25)
+    widget.param_widgets["movement_end_offset_y"].setValue(8)
+    widget.param_widgets["movement_duration"].setValue(0.75)
+    widget.param_widgets["movement_button"].setCurrentIndex(widget.param_widgets["movement_button"].findText("right"))
+    widget.param_widgets["movement_button_action"].setCurrentIndex(widget.param_widgets["movement_button_action"].findText("hold_during_move"))
+
+    with qtbot.waitSignal(widget.actionChanged, timeout=1000) as blocker:
+        widget.apply_button.click()
+
+    row, updated = blocker.args
+    assert row == 0
+    assert updated.params["click_action"] == "custom_movement"
+    assert updated.params["movement_start_offset"] == [5, -2]
+    assert updated.params["movement_end_offset"] == [25, 8]
+    assert updated.params["movement_duration"] == 0.75
+    assert updated.params["movement_button"] == "right"
+    assert updated.params["movement_button_action"] == "hold_during_move"
 
 
 def test_action_properties_emits_if_image_result_params(qtbot):
@@ -70,7 +120,7 @@ def test_action_properties_emits_open_file_params(qtbot):
     action = create_action(ActionType.OPEN_FILE)
     widget.set_action(0, action)
 
-    widget.param_widgets["file_path"].setText(r"C:\Users\marto\Documents\notes.pdf")
+    widget.param_widgets["file_path"].setText(r"C:\TestData\notes.pdf")
     widget.param_widgets["target_monitor"].setCurrentIndex(widget.param_widgets["target_monitor"].findData("2"))
     widget.param_widgets["auto_focus"].setChecked(True)
 
@@ -80,7 +130,7 @@ def test_action_properties_emits_open_file_params(qtbot):
     row, updated = blocker.args
     assert row == 0
     assert updated.type == ActionType.OPEN_FILE
-    assert updated.params["file_path"] == r"C:\Users\marto\Documents\notes.pdf"
+    assert updated.params["file_path"] == r"C:\TestData\notes.pdf"
     assert updated.params["target_monitor"] == "2"
     assert updated.params["auto_focus"] is True
 

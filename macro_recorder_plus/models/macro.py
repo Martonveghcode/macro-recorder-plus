@@ -9,6 +9,19 @@ from .environment import RecordedEnvironment
 
 
 FORMAT_VERSION = 1
+MAX_MACRO_LOOP_COUNT = 99999
+
+
+def clamp_macro_loop_count(value: Any) -> int:
+    try:
+        count = int(value)
+    except (TypeError, ValueError):
+        count = 1
+    return min(MAX_MACRO_LOOP_COUNT, max(1, count))
+
+
+def default_macro_settings() -> dict[str, Any]:
+    return {"playback_speed": 1.0, "coordinate_mode": "exact", "macro_loop_count": 1}
 
 
 def utc_now() -> str:
@@ -18,9 +31,10 @@ def utc_now() -> str:
 @dataclass(slots=True)
 class MacroDocument:
     name: str = "Untitled Macro"
+    pre_actions: list[MacroAction] = field(default_factory=list)
     actions: list[MacroAction] = field(default_factory=list)
     recorded_environment: RecordedEnvironment = field(default_factory=RecordedEnvironment)
-    settings: dict[str, Any] = field(default_factory=lambda: {"playback_speed": 1.0, "coordinate_mode": "exact"})
+    settings: dict[str, Any] = field(default_factory=default_macro_settings)
     created_at: str = field(default_factory=utc_now)
     updated_at: str = field(default_factory=utc_now)
     format_version: int = FORMAT_VERSION
@@ -42,6 +56,7 @@ class MacroDocument:
             "updated_at": self.updated_at,
             "recorded_environment": self.recorded_environment.to_dict(),
             "settings": self.settings,
+            "pre_actions": [action.to_dict() for action in self.pre_actions],
             "actions": [action.to_dict() for action in self.actions],
         }
 
@@ -57,12 +72,22 @@ class MacroDocument:
             raise ValueError("macro actions must be a list")
         actions = [MacroAction.from_dict(item) for item in actions_data]
         actions.sort(key=lambda action: action.timestamp)
+        pre_actions_data = data.get("pre_actions", [])
+        if not isinstance(pre_actions_data, list):
+            raise ValueError("macro pre-actions must be a list")
+        pre_actions = [MacroAction.from_dict(item) for item in pre_actions_data]
+        pre_actions.sort(key=lambda action: action.timestamp)
+        settings = dict(data.get("settings") or default_macro_settings())
+        settings.setdefault("playback_speed", 1.0)
+        settings.setdefault("coordinate_mode", "exact")
+        settings["macro_loop_count"] = clamp_macro_loop_count(settings.get("macro_loop_count", 1))
         return cls(
             format_version=version,
             name=str(data.get("name") or "Untitled Macro"),
             created_at=str(data.get("created_at") or utc_now()),
             updated_at=str(data.get("updated_at") or utc_now()),
             recorded_environment=RecordedEnvironment.from_dict(data.get("recorded_environment")),
-            settings=dict(data.get("settings") or {"playback_speed": 1.0, "coordinate_mode": "exact"}),
+            settings=settings,
+            pre_actions=pre_actions,
             actions=actions,
         )

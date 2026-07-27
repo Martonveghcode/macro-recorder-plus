@@ -126,3 +126,92 @@ def test_backward_if_image_result_loop_runs_until_image_is_not_found(monkeypatch
     assert progress_rows == [1, 2, 3, 4, 5, 6, 7, 8, 9, 7, 8, 9]
     assert statuses == ["If Image Result jumped to action 7"]
     assert finished == [(True, "Playback complete")]
+
+
+def test_action_loop_count_repeats_row_before_advancing(monkeypatch):
+    class FakeMouseController:
+        def __init__(self) -> None:
+            self.position = (100, 100)
+
+    pynput_module = ModuleType("pynput")
+    pynput_module.keyboard = SimpleNamespace(Controller=lambda: SimpleNamespace(type=lambda text: None))
+    pynput_module.mouse = SimpleNamespace(Controller=FakeMouseController)
+    monkeypatch.setitem(sys.modules, "pynput", pynput_module)
+
+    actions = [
+        MacroAction(type=ActionType.COMMENT, loop_count=3, params={"text": "repeat"}),
+        MacroAction(type=ActionType.COMMENT, params={"text": "next"}),
+    ]
+    worker = _worker(actions)
+    progress_rows: list[int] = []
+    finished: list[tuple[bool, str]] = []
+    worker.progress.connect(lambda row, action: progress_rows.append(row + 1))
+    worker.finished.connect(lambda completed, message: finished.append((completed, message)))
+
+    worker.run()
+
+    assert progress_rows == [1, 1, 1, 2]
+    assert finished == [(True, "Playback complete")]
+
+
+def test_macro_repeat_count_replays_all_actions(monkeypatch):
+    class FakeMouseController:
+        def __init__(self) -> None:
+            self.position = (100, 100)
+
+    pynput_module = ModuleType("pynput")
+    pynput_module.keyboard = SimpleNamespace(Controller=lambda: SimpleNamespace(type=lambda text: None))
+    pynput_module.mouse = SimpleNamespace(Controller=FakeMouseController)
+    monkeypatch.setitem(sys.modules, "pynput", pynput_module)
+
+    environment = RecordedEnvironment()
+    actions = [create_action(ActionType.COMMENT), create_action(ActionType.COMMENT)]
+    worker = PlaybackWorker(
+        actions,
+        repeat_count=3,
+        recorded_environment=environment,
+        current_environment_snapshot=environment,
+    )
+    progress_rows: list[int] = []
+    statuses: list[str] = []
+    finished: list[tuple[bool, str]] = []
+    worker.progress.connect(lambda row, action: progress_rows.append(row + 1))
+    worker.status.connect(statuses.append)
+    worker.finished.connect(lambda completed, message: finished.append((completed, message)))
+
+    worker.run()
+
+    assert progress_rows == [1, 2, 1, 2, 1, 2]
+    assert statuses == ["Playing macro loop 1 of 3", "Playing macro loop 2 of 3", "Playing macro loop 3 of 3"]
+    assert finished == [(True, "Playback complete (3 loops)")]
+
+
+def test_bounded_step_playback_executes_only_requested_rows(monkeypatch):
+    class FakeMouseController:
+        def __init__(self) -> None:
+            self.position = (100, 100)
+
+    pynput_module = ModuleType("pynput")
+    pynput_module.keyboard = SimpleNamespace(Controller=lambda: SimpleNamespace(type=lambda text: None))
+    pynput_module.mouse = SimpleNamespace(Controller=FakeMouseController)
+    monkeypatch.setitem(sys.modules, "pynput", pynput_module)
+
+    environment = RecordedEnvironment()
+    actions = [create_action(ActionType.COMMENT) for _ in range(3)]
+    worker = PlaybackWorker(
+        actions,
+        start_index=1,
+        end_index=2,
+        respect_action_delays=False,
+        recorded_environment=environment,
+        current_environment_snapshot=environment,
+    )
+    progress_rows: list[int] = []
+    contexts: list[tuple[int, bool | None]] = []
+    worker.progress.connect(lambda row, action: progress_rows.append(row))
+    worker.playbackContext.connect(lambda row, image_found: contexts.append((row, image_found)))
+
+    worker.run()
+
+    assert progress_rows == [1]
+    assert contexts == [(2, None)]

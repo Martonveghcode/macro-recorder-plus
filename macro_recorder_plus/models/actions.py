@@ -5,6 +5,8 @@ from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any
 
+MAX_ACTION_LOOP_COUNT = 99_999
+
 
 class ActionType(str, Enum):
     WAIT = "wait"
@@ -43,8 +45,17 @@ ACTION_LABELS = {
 
 DEFAULT_PARAMS: dict[ActionType, dict[str, Any]] = {
     ActionType.WAIT: {"seconds": 1.0},
-    ActionType.OPEN_URL: {"url": "https://example.com"},
-    ActionType.OPEN_FILE: {"file_path": "", "target_monitor": "default", "auto_focus": False},
+    ActionType.OPEN_URL: {
+        "url": "https://example.com",
+        "auto_focus": False,
+        "window_placement": None,
+    },
+    ActionType.OPEN_FILE: {
+        "file_path": "",
+        "target_monitor": "default",
+        "auto_focus": False,
+        "window_placement": None,
+    },
     ActionType.LAUNCH_PROGRAM: {
         "executable": "",
         "arguments": "",
@@ -53,6 +64,7 @@ DEFAULT_PARAMS: dict[ActionType, dict[str, Any]] = {
         "auto_focus": False,
         "wait_for_startup": False,
         "startup_timeout": 10.0,
+        "window_placement": None,
     },
     ActionType.TYPE_TEXT: {"text": ""},
     ActionType.TYPE_SECRET: {"environment_variable": "WEBSITE_PASSWORD"},
@@ -73,11 +85,20 @@ DEFAULT_PARAMS: dict[ActionType, dict[str, Any]] = {
         "timeout": 5.0,
         "poll_interval": 0.25,
         "grayscale": True,
+        "verification_attempts": 2,
+        "stable_match_pixels": 8,
+        "scale_tolerance": 0.05,
         "on_not_found": "error",
         "region_x": 0,
         "region_y": 0,
         "region_width": 0,
         "region_height": 0,
+        "movement_start_offset": [0, 0],
+        "movement_end_offset": [0, 0],
+        "movement_duration": 0.5,
+        "movement_button": "left",
+        "movement_button_action": "none",
+        "movement_path": [],
     },
     ActionType.IF_CONDITION: {
         "image_found_action": 0,
@@ -97,12 +118,21 @@ def _format_action_target(value: Any) -> str:
     return f"action {action_number}"
 
 
+def clamp_loop_count(value: Any) -> int:
+    try:
+        count = int(value)
+    except (TypeError, ValueError):
+        count = 1
+    return min(MAX_ACTION_LOOP_COUNT, max(1, count))
+
+
 @dataclass(slots=True)
 class MacroAction:
     type: ActionType
     delay: float = 0.0
     timestamp: float = 0.0
     duration: float = 0.0
+    loop_count: int = 1
     params: dict[str, Any] = field(default_factory=dict)
     label: str = ""
     enabled: bool = True
@@ -114,6 +144,7 @@ class MacroAction:
         self.delay = max(0.0, float(self.delay))
         self.timestamp = max(0.0, float(self.timestamp))
         self.duration = max(0.0, float(self.duration))
+        self.loop_count = clamp_loop_count(self.loop_count)
         defaults = dict(DEFAULT_PARAMS.get(self.type, {}))
         defaults.update(self.params)
         self.params = defaults
@@ -206,6 +237,7 @@ class MacroAction:
             "delay": self.delay,
             "timestamp": self.timestamp,
             "duration": self.duration,
+            "loop_count": self.loop_count,
             "label": self.label,
             "params": self.params,
         }
@@ -223,6 +255,7 @@ class MacroAction:
             delay=float(data.get("delay", 0.0)),
             timestamp=float(data.get("timestamp", 0.0)),
             duration=float(data.get("duration", 0.0)),
+            loop_count=clamp_loop_count(data.get("loop_count", 1)),
             label=str(data.get("label", "")),
             params=dict(data.get("params") or {}),
         )

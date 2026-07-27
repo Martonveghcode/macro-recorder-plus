@@ -8,7 +8,7 @@ from macro_recorder_plus.models.actions import ACTION_LABELS, ActionType, MacroA
 class ActionTableModel(QAbstractTableModel):
     dirtyChanged = Signal(bool)
 
-    COLUMNS = ["Index", "Enabled", "Action type", "Description", "Delay", "Timestamp", "Duration", "Target", "Label"]
+    COLUMNS = ["Index", "Enabled", "Loops", "Action type", "Description", "Delay", "Timestamp", "Duration", "Target", "Label"]
 
     def __init__(self, actions: list[MacroAction] | None = None, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -56,6 +56,7 @@ class ActionTableModel(QAbstractTableModel):
         values = [
             index.row() + 1,
             action.enabled,
+            action.loop_count,
             ACTION_LABELS[action.type],
             action.description,
             f"{action.delay:.3f}",
@@ -70,7 +71,7 @@ class ActionTableModel(QAbstractTableModel):
         if not index.isValid():
             return Qt.ItemIsEnabled
         flags = Qt.ItemIsSelectable | Qt.ItemIsEnabled
-        if index.column() in {1, 4, 8}:
+        if index.column() in {1, 2, 5, 9}:
             flags |= Qt.ItemIsEditable
         if index.column() == 1:
             flags |= Qt.ItemIsUserCheckable
@@ -83,9 +84,13 @@ class ActionTableModel(QAbstractTableModel):
         column = index.column()
         if column == 1 and role in {Qt.CheckStateRole, Qt.EditRole}:
             action.enabled = value == Qt.Checked or value is True
-        elif column == 4 and role == Qt.EditRole:
+        elif column == 2 and role == Qt.EditRole:
+            from macro_recorder_plus.models.actions import clamp_loop_count
+
+            action.loop_count = clamp_loop_count(value)
+        elif column == 5 and role == Qt.EditRole:
             action.delay = max(0.0, float(value))
-        elif column == 8 and role == Qt.EditRole:
+        elif column == 9 and role == Qt.EditRole:
             action.label = str(value)
         else:
             return False

@@ -40,3 +40,23 @@ def _perpendicular_distance(point: Point, start: Point, end: Point) -> float:
 
 def path_to_json(points: Sequence[Point]) -> list[list[float]]:
     return [[int(x), int(y), round(float(t), 6)] for x, y, t in points]
+
+
+def interpolated_path_points(points: Sequence[Point], *, hz: int = 60) -> list[Point]:
+    if len(points) <= 1:
+        return list(points)
+
+    first_time = points[0][2]
+    output = [(points[0][0], points[0][1], 0.0)]
+    for previous, current in zip(points, points[1:], strict=False):
+        x1, y1, t1 = previous
+        x2, y2, t2 = current
+        segment_duration = max(0.0, t2 - t1)
+        steps = max(1, math.ceil(segment_duration * hz))
+        for step in range(1, steps + 1):
+            alpha = step / steps
+            x = round(x1 + (x2 - x1) * alpha)
+            y = round(y1 + (y2 - y1) * alpha)
+            relative_time = max(0.0, (t1 - first_time) + (segment_duration * alpha))
+            output.append((x, y, relative_time))
+    return output

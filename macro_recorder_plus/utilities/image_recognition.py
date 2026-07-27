@@ -7,6 +7,11 @@ from pathlib import Path
 from typing import Any, Callable
 
 
+DEFAULT_VERIFICATION_ATTEMPTS = 2
+DEFAULT_STABLE_MATCH_PIXELS = 8
+DEFAULT_SCALE_TOLERANCE = 0.05
+
+
 @dataclass(frozen=True, slots=True)
 class ImageMatch:
     x: int
@@ -30,6 +35,9 @@ def find_image_on_screen(
     wait_until_found: bool = True,
     grayscale: bool = True,
     region: tuple[int, int, int, int] | None = None,
+    verification_attempts: int = DEFAULT_VERIFICATION_ATTEMPTS,
+    stable_match_pixels: int = DEFAULT_STABLE_MATCH_PIXELS,
+    scale_tolerance: float = DEFAULT_SCALE_TOLERANCE,
     stop_check: Callable[[], bool] | None = None,
 ) -> ImageMatch | None:
     from PIL import Image, ImageGrab
@@ -42,19 +50,110 @@ def find_image_on_screen(
     timeout_seconds = max(0.0, float(timeout))
     poll_seconds = poll_interval_from_frequency(poll_interval, checks_per_second)
     deadline = None if wait_until_found and timeout_seconds <= 0 else time.perf_counter() + timeout_seconds
+    required_stable_matches = max(1, int(verification_attempts or 1))
+    stable_pixels = max(0, int(stable_match_pixels or 0))
+    best_streak_match: ImageMatch | None = None
+    stable_count = 0
+    checked_once = False
+
     while True:
         if stop_check is not None and stop_check():
             return None
         screenshot, offset_x, offset_y = _grab_screen(ImageGrab, region)
-        match = locate_image_in_image(screenshot, template, confidence=confidence, grayscale=grayscale)
-        if match is not None:
-            return ImageMatch(
-                x=match.x + offset_x,
-                y=match.y + offset_y,
-                width=match.width,
-                height=match.height,
-                confidence=match.confidence,
+        local_match = locate_image_in_image(
+            screenshot,
+            template,
+            confidence=confidence,
+            grayscale=grayscale,
+            scale_tolerance=scale_tolerance,
+        )
+        checked_once = True
+        if local_match is not None:
+            match = ImageMatch(
+                x=local_match.x + offset_x,
+                y=local_match.y + offset_y,
+                width=local_match.width,
+                height=local_match.height,
+                confidence=local_match.confidence,
             )
+            if _matches_are_stable(best_streak_match, match, max_center_distance=stable_pixels):
+                stable_count += 1
+                if match.confidence >= best_streak_match.confidence:  # type: ignore[union-attr]
+                    best_streak_match = match
+            else:
+                best_streak_match = match
+                stable_count = 1
+            if stable_count >= required_stable_matches:
+                return best_streak_match
+        else:
+            best_streak_match = None
+            stable_count = 0
+            if not wait_until_found and checked_once:
+                required_misses = max(1, int(verification_attempts or 1))
+                required_misses -= 1
+                if required_misses <= 0:
+                    return None
+                for _ in range(required_misses):
+                    if not _sleep_with_stop_check(min(poll_seconds, 0.05), stop_check):
+                        return None
+                    screenshot, offset_x, offset_y = _grab_screen(ImageGrab, region)
+                    local_match = locate_image_in_image(
+                        screenshot,
+                        template,
+                        confidence=confidence,
+                        grayscale=grayscale,
+                        scale_tolerance=scale_tolerance,
+                    )
+                    if local_match is not None:
+                        best_streak_match = ImageMatch(
+                            x=local_match.x + offset_x,
+                            y=local_match.y + offset_y,
+                            width=local_match.width,
+                            height=local_match.height,
+                            confidence=local_match.confidence,
+                        )
+                        stable_count = 1
+                        break
+                if stable_count == 0:
+                    return None
+
+        if not wait_until_found and local_match is not None and stable_count < required_stable_matches:
+            # Verification found something once, but it was not stable enough. Try the remaining
+            # quick verification captures before deciding the one-shot check failed.
+            remaining = required_stable_matches - stable_count
+            for _ in range(max(0, remaining)):
+                if not _sleep_with_stop_check(min(poll_seconds, 0.05), stop_check):
+                    return None
+                screenshot, offset_x, offset_y = _grab_screen(ImageGrab, region)
+                local_match = locate_image_in_image(
+                    screenshot,
+                    template,
+                    confidence=confidence,
+                    grayscale=grayscale,
+                    scale_tolerance=scale_tolerance,
+                )
+                if local_match is None:
+                    best_streak_match = None
+                    stable_count = 0
+                    break
+                match = ImageMatch(
+                    x=local_match.x + offset_x,
+                    y=local_match.y + offset_y,
+                    width=local_match.width,
+                    height=local_match.height,
+                    confidence=local_match.confidence,
+                )
+                if _matches_are_stable(best_streak_match, match, max_center_distance=stable_pixels):
+                    stable_count += 1
+                    if match.confidence >= best_streak_match.confidence:  # type: ignore[union-attr]
+                        best_streak_match = match
+                else:
+                    best_streak_match = match
+                    stable_count = 1
+                if stable_count >= required_stable_matches:
+                    return best_streak_match
+            return None
+
         if not wait_until_found:
             return None
         if deadline is not None and time.perf_counter() >= deadline:
@@ -77,25 +176,32 @@ def locate_image_in_image(
     confidence: float = 0.85,
     grayscale: bool = True,
     max_full_checks: int = 2000,
+    scale_tolerance: float = DEFAULT_SCALE_TOLERANCE,
 ) -> ImageMatch | None:
     import numpy as np
 
     confidence = min(1.0, max(0.0, float(confidence)))
-    screen_array = _image_to_array(screenshot, grayscale=grayscale, np=np)
-    template_array = _image_to_array(template, grayscale=grayscale, np=np)
+    screen_rgb = _image_to_rgb_array(screenshot, np=np)
+    template_rgb = _image_to_rgb_array(template, np=np)
 
-    screen_height, screen_width = screen_array.shape[:2]
-    template_height, template_width = template_array.shape[:2]
+    screen_height, screen_width = screen_rgb.shape[:2]
+    template_height, template_width = template_rgb.shape[:2]
     if template_width <= 0 or template_height <= 0:
         return None
     if template_width > screen_width or template_height > screen_height:
         return None
 
-    cv2_match = _locate_with_cv2(screen_array, template_array, confidence)
+    cv2_match = _locate_with_cv2(screen_rgb, template_rgb, confidence, grayscale=grayscale, scale_tolerance=scale_tolerance)
     if cv2_match is not None:
-        x, y, score = cv2_match
-        return ImageMatch(x=x, y=y, width=template_width, height=template_height, confidence=score)
+        x, y, width, height, score = cv2_match
+        return ImageMatch(x=x, y=y, width=width, height=height, confidence=score)
 
+    # Fallback path for machines without OpenCV. It is slower and less tolerant than the
+    # OpenCV path, but keeps the app functional with only Pillow + NumPy installed.
+    screen_array = _image_to_array(screenshot, grayscale=grayscale, np=np)
+    template_array = _image_to_array(template, grayscale=grayscale, np=np)
+    screen_height, screen_width = screen_array.shape[:2]
+    template_height, template_width = template_array.shape[:2]
     candidate_height = screen_height - template_height + 1
     candidate_width = screen_width - template_width + 1
     mask = np.ones((candidate_height, candidate_width), dtype=bool)
@@ -176,30 +282,110 @@ def _virtual_screen_origin() -> tuple[int, int]:
 
 def _image_to_array(image: Any, *, grayscale: bool, np: Any) -> Any:
     converted = image.convert("L" if grayscale else "RGB")
-    array = np.asarray(converted, dtype=np.float32)
-    if grayscale:
-        return array
-    return array
+    return np.asarray(converted, dtype=np.float32)
 
 
-def _locate_with_cv2(screen_array: Any, template_array: Any, confidence: float) -> tuple[int, int, float] | None:
+def _image_to_rgb_array(image: Any, *, np: Any) -> Any:
+    return np.asarray(image.convert("RGB"), dtype=np.uint8)
+
+
+def _locate_with_cv2(
+    screen_rgb: Any,
+    template_rgb: Any,
+    confidence: float,
+    *,
+    grayscale: bool,
+    scale_tolerance: float,
+) -> tuple[int, int, int, int, float] | None:
     try:
         import cv2
         import numpy as np
     except Exception:
         return None
 
-    if float(np.std(template_array)) < 0.001:
-        return None
+    screen_gray = cv2.cvtColor(screen_rgb, cv2.COLOR_RGB2GRAY)
+    template_gray = cv2.cvtColor(template_rgb, cv2.COLOR_RGB2GRAY)
+    best: tuple[int, int, int, int, float] | None = None
 
-    method = cv2.TM_CCOEFF_NORMED
-    result = cv2.matchTemplate(screen_array, template_array, method)
-    _, max_value, _, max_location = cv2.minMaxLoc(result)
-    score = float(max_value)
-    if score < confidence:
+    for scaled_template_rgb, scaled_template_gray in _scaled_templates(template_rgb, template_gray, scale_tolerance, cv2=cv2, np=np):
+        template_height, template_width = scaled_template_gray.shape[:2]
+        if template_width <= 0 or template_height <= 0:
+            continue
+        if template_width > screen_gray.shape[1] or template_height > screen_gray.shape[0]:
+            continue
+
+        attempts: list[tuple[Any, Any, int]] = []
+        gray_std = float(np.std(scaled_template_gray))
+        attempts.append((screen_gray, scaled_template_gray, cv2.TM_SQDIFF_NORMED))
+        if gray_std >= 1.0:
+            attempts.append((screen_gray, scaled_template_gray, cv2.TM_CCOEFF_NORMED))
+            attempts.append((cv2.equalizeHist(screen_gray), cv2.equalizeHist(scaled_template_gray), cv2.TM_CCOEFF_NORMED))
+            screen_edges = cv2.Canny(screen_gray, 50, 150)
+            template_edges = cv2.Canny(scaled_template_gray, 50, 150)
+            if int(np.count_nonzero(template_edges)) >= max(8, template_width * template_height // 80):
+                attempts.append((screen_edges, template_edges, cv2.TM_CCOEFF_NORMED))
+
+        if not grayscale:
+            attempts.append((screen_rgb, scaled_template_rgb, cv2.TM_SQDIFF_NORMED))
+            if float(np.std(scaled_template_rgb)) >= 1.0:
+                attempts.append((screen_rgb, scaled_template_rgb, cv2.TM_CCOEFF_NORMED))
+
+        for screen_variant, template_variant, method in attempts:
+            try:
+                score, location = _best_cv2_location(screen_variant, template_variant, method, cv2=cv2)
+            except Exception:
+                continue
+            if best is None or score > best[4]:
+                x, y = location
+                best = (int(x), int(y), int(template_width), int(template_height), float(score))
+
+    if best is None or best[4] < confidence:
         return None
-    x, y = max_location
-    return int(x), int(y), score
+    return best
+
+
+def _scaled_templates(template_rgb: Any, template_gray: Any, scale_tolerance: float, *, cv2: Any, np: Any) -> list[tuple[Any, Any]]:
+    tolerance = max(0.0, min(0.25, float(scale_tolerance or 0.0)))
+    scales = [1.0]
+    if tolerance > 0:
+        scales.extend([1.0 - tolerance * 0.4, 1.0 + tolerance * 0.4, 1.0 - tolerance, 1.0 + tolerance])
+    output: list[tuple[Any, Any]] = []
+    seen: set[tuple[int, int]] = set()
+    height, width = template_gray.shape[:2]
+    for scale in scales:
+        scaled_width = max(1, int(round(width * scale)))
+        scaled_height = max(1, int(round(height * scale)))
+        key = (scaled_width, scaled_height)
+        if key in seen:
+            continue
+        seen.add(key)
+        if scale == 1.0:
+            output.append((template_rgb, template_gray))
+            continue
+        interpolation = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_CUBIC
+        output.append(
+            (
+                cv2.resize(template_rgb, key, interpolation=interpolation),
+                cv2.resize(template_gray, key, interpolation=interpolation),
+            )
+        )
+    return output
+
+
+def _best_cv2_location(screen: Any, template: Any, method: int, *, cv2: Any) -> tuple[float, tuple[int, int]]:
+    result = cv2.matchTemplate(screen, template, method)
+    min_value, max_value, min_location, max_location = cv2.minMaxLoc(result)
+    if method == cv2.TM_SQDIFF_NORMED:
+        return 1.0 - float(min_value), min_location
+    return float(max_value), max_location
+
+
+def _matches_are_stable(previous: ImageMatch | None, current: ImageMatch, *, max_center_distance: int) -> bool:
+    if previous is None:
+        return False
+    prev_x, prev_y = previous.center
+    curr_x, curr_y = current.center
+    return abs(prev_x - curr_x) <= max_center_distance and abs(prev_y - curr_y) <= max_center_distance
 
 
 def _sample_points(width: int, height: int) -> list[tuple[int, int]]:

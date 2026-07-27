@@ -10,7 +10,9 @@ from macro_recorder_plus.playback.safety_controller import SafetyController
 
 class PlaybackEngine(QObject):
     progress = Signal(int, object)
+    preActionProgress = Signal(int, object)
     status = Signal(str)
+    playbackContext = Signal(int, object)
     finished = Signal(bool, str)
     error = Signal(str)
 
@@ -28,8 +30,13 @@ class PlaybackEngine(QObject):
         self,
         actions: list[MacroAction],
         *,
+        pre_actions: list[MacroAction] | None = None,
         start_index: int = 0,
+        end_index: int | None = None,
+        repeat_count: int = 1,
         speed: float = 1.0,
+        respect_action_delays: bool = True,
+        initial_image_found: bool | None = None,
         recorded_environment: RecordedEnvironment | None = None,
         current_environment_snapshot: RecordedEnvironment | None = None,
         coordinate_mode: str = "exact",
@@ -40,8 +47,13 @@ class PlaybackEngine(QObject):
         self._thread = QThread(self)
         self._worker = PlaybackWorker(
             actions,
+            pre_actions=pre_actions,
             start_index=start_index,
+            end_index=end_index,
+            repeat_count=repeat_count,
             speed=speed,
+            respect_action_delays=respect_action_delays,
+            initial_image_found=initial_image_found,
             safety=self.safety,
             recorded_environment=recorded_environment,
             current_environment_snapshot=current_environment_snapshot,
@@ -50,7 +62,9 @@ class PlaybackEngine(QObject):
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
         self._worker.progress.connect(self.progress)
+        self._worker.preActionProgress.connect(self.preActionProgress)
         self._worker.status.connect(self.status)
+        self._worker.playbackContext.connect(self.playbackContext)
         self._worker.error.connect(self.error)
         self._worker.finished.connect(self.finished)
         self._worker.finished.connect(self._thread.quit)
