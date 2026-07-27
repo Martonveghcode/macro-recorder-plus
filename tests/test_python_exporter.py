@@ -34,6 +34,7 @@ def test_python_export_contains_cli_options_and_macro_data(tmp_path):
     assert "<f10>" in text
     assert "WEBSITE_PASSWORD" in text
     assert "set_dpi_awareness" in text
+    assert "SetThreadDpiAwarenessContext" in text
     assert "interpolated_mouse_points" in text
     assert "mouse_move_points" in text
     assert "transform_action_coordinates" in text
@@ -46,6 +47,8 @@ def test_python_export_contains_cli_options_and_macro_data(tmp_path):
     assert 'return sys.platform == "win32" and len(sys.argv) == 1' in text
     assert 'RUNTIME_DIR / f"{Path(__file__).stem}.log"' in text
     assert "traceback.print_exc()" in text
+    main_text = text.split("def main():", 1)[1]
+    assert main_text.index("set_dpi_awareness()") < main_text.index("hide_console_window()")
 
 
 def test_python_export_is_valid_and_dry_run_does_not_need_pynput(tmp_path):

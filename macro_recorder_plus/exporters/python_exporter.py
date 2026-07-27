@@ -128,16 +128,23 @@ def hide_console_window():
 def set_dpi_awareness():
     if sys.platform != "win32":
         return
+    user32 = ctypes.windll.user32
     try:
-        ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
+        user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
     except Exception:
         try:
             ctypes.windll.shcore.SetProcessDpiAwareness(2)
         except Exception:
             try:
-                ctypes.windll.user32.SetProcessDPIAware()
+                user32.SetProcessDPIAware()
             except Exception:
                 pass
+    try:
+        user32.SetThreadDpiAwarenessContext.argtypes = [ctypes.c_void_p]
+        user32.SetThreadDpiAwarenessContext.restype = ctypes.c_void_p
+        user32.SetThreadDpiAwarenessContext(ctypes.c_void_p(-4))
+    except Exception:
+        pass
 
 
 def current_virtual_desktop():
@@ -969,6 +976,9 @@ def clamp_loop_count(value):
 
 
 def main():
+    # DPI awareness must be configured before hiding the double-click console.
+    # A User32 call made first can lock the process into DPI-virtualized coordinates.
+    set_dpi_awareness()
     parser = argparse.ArgumentParser(description="Run an exported Macro Recorder + macro.")
     parser.add_argument("--speed", type=float, default=None, help="Override the saved playback speed.")
     parser.add_argument("--loops", type=int, default=None, help="Override the saved whole-macro loop count.")
@@ -997,7 +1007,6 @@ def main():
     if args.install_deps:
         return install_dependencies()
 
-    set_dpi_awareness()
     speed = max(
         0.01,
         float(args.speed if args.speed is not None else MACRO.get("settings", {}).get("playback_speed", 1.0)),
