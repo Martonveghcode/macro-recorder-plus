@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import py_compile
+import runpy
 import subprocess
 import sys
 
@@ -8,6 +9,7 @@ from PIL import Image
 
 from macro_recorder_plus.exporters.python_exporter import ASSETS_DIR_NAME, RUNTIME_DIR_NAME, PythonExporter
 from macro_recorder_plus.models.actions import ActionType, MacroAction
+from macro_recorder_plus.models.environment import RecordedEnvironment, Rect
 from macro_recorder_plus.models.macro import MacroDocument
 
 
@@ -22,11 +24,15 @@ def test_python_export_contains_cli_options_and_macro_data(tmp_path):
 
     assert "--dry-run" in text
     assert "--start-action" in text
+    assert "--end-action" in text
     assert "<f10>" in text
     assert "WEBSITE_PASSWORD" in text
     assert "set_dpi_awareness" in text
     assert "interpolated_mouse_points" in text
     assert "mouse_move_points" in text
+    assert "transform_action_coordinates" in text
+    assert "begin_macro_loop" in text
+    assert "position_mouse" in text
 
 
 def test_python_export_is_valid_and_dry_run_does_not_need_pynput(tmp_path):
@@ -94,6 +100,80 @@ def test_python_export_dry_run_repeats_whole_macro_and_allows_override(tmp_path)
     assert saved_result.stdout.count("0: comment") == 3
     assert override_result.returncode == 0
     assert override_result.stdout.count("0: comment") == 2
+
+
+def test_python_export_can_limit_playback_to_an_action_range(tmp_path):
+    document = MacroDocument(
+        name="export",
+        actions=[
+            MacroAction(type=ActionType.COMMENT, label="first"),
+            MacroAction(type=ActionType.COMMENT, label="second"),
+            MacroAction(type=ActionType.COMMENT, label="third"),
+        ],
+    )
+    path = PythonExporter().export(document, tmp_path / "exported.py")
+
+    result = subprocess.run(
+        [sys.executable, str(path), "--dry-run", "--start-action", "1", "--end-action", "2"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert "first" not in result.stdout
+    assert "second" in result.stdout
+    assert "third" not in result.stdout
+
+
+def test_python_export_uses_saved_playback_speed_by_default(tmp_path):
+    document = MacroDocument(
+        name="export",
+        settings={"playback_speed": 1.75, "coordinate_mode": "exact", "macro_loop_count": 1},
+    )
+    path = PythonExporter().export(document, tmp_path / "exported.py")
+    text = path.read_text(encoding="utf-8")
+
+    assert 'parser.add_argument("--speed", type=float, default=None' in text
+    assert 'MACRO.get("settings", {}).get("playback_speed", 1.0)' in text
+
+
+def test_python_export_coordinate_transform_and_verified_mouse_match_app(tmp_path):
+    document = MacroDocument(
+        name="export",
+        recorded_environment=RecordedEnvironment(virtual_desktop=Rect(0, 0, 100, 100), cursor_start=[25, 50]),
+        settings={"playback_speed": 1.0, "coordinate_mode": "scaled", "macro_loop_count": 1},
+    )
+    path = PythonExporter().export(document, tmp_path / "exported.py")
+    exported = runpy.run_path(str(path))
+
+    transformed = exported["transform_point"](
+        50,
+        50,
+        document.recorded_environment.to_dict(),
+        {"left": -200, "top": 0, "right": 200, "bottom": 200},
+        "scaled",
+    )
+
+    class LaggingMouse:
+        def __init__(self):
+            self.assignments = 0
+            self._position = (0, 0)
+
+        @property
+        def position(self):
+            return self._position
+
+        @position.setter
+        def position(self, value):
+            self.assignments += 1
+            self._position = (0, 0) if self.assignments < 3 else value
+
+    mouse = LaggingMouse()
+
+    assert transformed == (0, 100)
+    assert exported["position_mouse"](mouse, 500, -200) == (500, -200)
+    assert mouse.assignments == 3
 
 
 def test_python_export_runs_pre_actions_once_before_looped_actions(tmp_path):

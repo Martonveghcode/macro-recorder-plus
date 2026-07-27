@@ -116,6 +116,100 @@ def set_dpi_awareness():
                 pass
 
 
+def current_virtual_desktop():
+    if sys.platform != "win32":
+        return {"left": 0, "top": 0, "right": 0, "bottom": 0}
+    user32 = ctypes.windll.user32
+    left = int(user32.GetSystemMetrics(76))
+    top = int(user32.GetSystemMetrics(77))
+    width = int(user32.GetSystemMetrics(78))
+    height = int(user32.GetSystemMetrics(79))
+    return {"left": left, "top": top, "right": left + width, "bottom": top + height}
+
+
+def rect_size(rect):
+    return (
+        max(0, int(rect.get("right", 0)) - int(rect.get("left", 0))),
+        max(0, int(rect.get("bottom", 0)) - int(rect.get("top", 0))),
+    )
+
+
+def clamp_point(x, y, bounds):
+    width, height = rect_size(bounds)
+    if width <= 0 or height <= 0:
+        return int(x), int(y)
+    left = int(bounds.get("left", 0))
+    top = int(bounds.get("top", 0))
+    return (
+        min(max(int(x), left), left + width - 1),
+        min(max(int(y), top), top + height - 1),
+    )
+
+
+def transform_point(x, y, recorded_environment, current_bounds, mode="exact"):
+    recorded_bounds = recorded_environment.get("virtual_desktop", {})
+    recorded_width, recorded_height = rect_size(recorded_bounds)
+    current_width, current_height = rect_size(current_bounds)
+    if str(mode) == "exact" or recorded_width <= 0 or current_width <= 0:
+        return clamp_point(x, y, current_bounds)
+    recorded_left = int(recorded_bounds.get("left", 0))
+    recorded_top = int(recorded_bounds.get("top", 0))
+    current_left = int(current_bounds.get("left", 0))
+    current_top = int(current_bounds.get("top", 0))
+    relative_x = (int(x) - recorded_left) / max(1, recorded_width)
+    relative_y = (int(y) - recorded_top) / max(1, recorded_height)
+    transformed_x = current_left + round(relative_x * current_width)
+    transformed_y = current_top + round(relative_y * current_height)
+    return clamp_point(transformed_x, transformed_y, current_bounds)
+
+
+def transform_action_coordinates(action, recorded_environment, current_bounds, coordinate_mode):
+    action_type = action.get("type")
+    if action_type not in {"mouse_move", "mouse_button", "scroll"}:
+        return action
+    transformed = dict(action)
+    params = dict(action.get("params", {}))
+    if action_type == "mouse_move":
+        for key in ("start", "end"):
+            point = params.get(key)
+            if point:
+                params[key] = list(
+                    transform_point(point[0], point[1], recorded_environment, current_bounds, coordinate_mode)
+                )
+        if params.get("path"):
+            params["path"] = [
+                [
+                    *transform_point(point[0], point[1], recorded_environment, current_bounds, coordinate_mode),
+                    point[2],
+                ]
+                for point in params["path"]
+                if len(point) >= 3
+            ]
+    elif "x" in params and "y" in params:
+        params["x"], params["y"] = transform_point(
+            params["x"], params["y"], recorded_environment, current_bounds, coordinate_mode
+        )
+    transformed["params"] = params
+    return transformed
+
+
+def position_mouse(mouse_controller, x, y, attempts=3, tolerance=1):
+    target = (int(x), int(y))
+    last_position = None
+    for attempt in range(max(1, int(attempts))):
+        mouse_controller.position = target
+        actual = getattr(mouse_controller, "position", target)
+        try:
+            last_position = (int(actual[0]), int(actual[1]))
+        except (TypeError, ValueError, IndexError):
+            last_position = target
+        if abs(last_position[0] - target[0]) <= tolerance and abs(last_position[1] - target[1]) <= tolerance:
+            return target
+        if attempt + 1 < attempts:
+            time.sleep(0.001)
+    raise RuntimeError(f"Mouse did not reach ({target[0]}, {target[1]}); Windows reported {last_position}")
+
+
 def install_dependencies():
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
     LOCAL_DEPS.mkdir(parents=True, exist_ok=True)
@@ -157,6 +251,8 @@ def key_from_name(name, keyboard):
         "escape": keyboard.Key.esc,
         "backspace": keyboard.Key.backspace,
         "delete": keyboard.Key.delete,
+        "home": keyboard.Key.home,
+        "end": keyboard.Key.end,
         "tab": keyboard.Key.tab,
         "space": keyboard.Key.space,
         "left": keyboard.Key.left,
@@ -165,7 +261,11 @@ def key_from_name(name, keyboard):
         "down": keyboard.Key.down,
     }
     key = str(name).lower().replace("key.", "")
-    return lookup.get(key) or keyboard.KeyCode.from_char(key)
+    if key in lookup:
+        return lookup[key]
+    if key.startswith("f") and key[1:].isdigit():
+        return getattr(keyboard.Key, key)
+    return keyboard.KeyCode.from_char(key)
 
 
 def button_from_name(name, mouse):
@@ -357,6 +457,16 @@ def find_top_level_window_for_executable(executable, *, timeout=10.0, title_hint
                 exact = next((hwnd for hwnd, title in found if title.casefold() == hint), None)
                 if exact is not None:
                     return exact
+                hinted = next(
+                    (
+                        hwnd
+                        for hwnd, title in found
+                        if hint in title.casefold() or title.casefold() in hint
+                    ),
+                    None,
+                )
+                if hinted is not None:
+                    return hinted
             return found[0][0]
         if time.perf_counter() >= deadline:
             return None
@@ -663,7 +773,7 @@ def execute_image_click(params, mouse_controller, mouse, stop_event=None, held_b
             return False
         raise RuntimeError(f"Image not found on screen: {params.get('image_path', '')}")
 
-    mouse_controller.position = match["center"]
+    position_mouse(mouse_controller, *match["center"])
     click_action = str(params.get("click_action", "left_click"))
     if click_action == "move_only":
         return True
@@ -692,7 +802,7 @@ def execute_image_movement(params, match, mouse_controller, mouse, stop_event=No
     if not interpolated_points:
         return
     first_x, first_y, _ = interpolated_points[0]
-    mouse_controller.position = (int(first_x), int(first_y))
+    position_mouse(mouse_controller, first_x, first_y)
     apply_image_movement_button(params, mouse_controller, mouse, "start", held_buttons)
     start_time = time.perf_counter()
     for x, y, relative_time in interpolated_points[1:]:
@@ -704,7 +814,7 @@ def execute_image_movement(params, match, mouse_controller, mouse, stop_event=No
             remaining = target - time.perf_counter()
             if remaining > 0:
                 time.sleep(remaining)
-        mouse_controller.position = (int(x), int(y))
+        position_mouse(mouse_controller, x, y)
     apply_image_movement_button(params, mouse_controller, mouse, "end", held_buttons)
 
 
@@ -823,10 +933,11 @@ def clamp_loop_count(value):
 
 def main():
     parser = argparse.ArgumentParser(description="Run an exported Macro Recorder + macro.")
-    parser.add_argument("--speed", type=float, default=1.0)
+    parser.add_argument("--speed", type=float, default=None, help="Override the saved playback speed.")
     parser.add_argument("--loops", type=int, default=None, help="Override the saved whole-macro loop count.")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--start-action", type=int, default=0)
+    parser.add_argument("--end-action", type=int, default=None, help="Stop before this zero-based action index.")
     parser.add_argument("--install-deps", action="store_true", help="Install runtime dependencies into the local export folder.")
     parser.add_argument("--no-hotkey", action="store_true", help="Disable the F10 emergency-stop listener.")
     args = parser.parse_args()
@@ -835,7 +946,13 @@ def main():
         return install_dependencies()
 
     set_dpi_awareness()
-    speed = max(0.01, args.speed)
+    speed = max(
+        0.01,
+        float(args.speed if args.speed is not None else MACRO.get("settings", {}).get("playback_speed", 1.0)),
+    )
+    recorded_environment = MACRO.get("recorded_environment", {})
+    current_bounds = current_virtual_desktop()
+    coordinate_mode = str(MACRO.get("settings", {}).get("coordinate_mode", "exact"))
     stop_event = threading.Event()
     hotkey_listener = None
     held_keys = []
@@ -874,11 +991,31 @@ def main():
         held_keys.clear()
         held_buttons.clear()
 
+    def begin_macro_loop():
+        release_all()
+        if args.dry_run or mouse_controller is None:
+            return
+        cursor_start = recorded_environment.get("cursor_start")
+        if cursor_start:
+            x, y = transform_point(
+                cursor_start[0],
+                cursor_start[1],
+                recorded_environment,
+                current_bounds,
+                coordinate_mode,
+            )
+            position_mouse(mouse_controller, x, y)
+
     try:
         main_actions = MACRO["actions"]
         pre_actions = MACRO.get("pre_actions", [])
         runtime_state = {"last_image_found": None}
         main_start_index = max(0, args.start_action)
+        main_end_index = (
+            len(main_actions)
+            if args.end_action is None
+            else min(len(main_actions), max(main_start_index, args.end_action))
+        )
         running_pre_actions = bool(pre_actions)
         actions = pre_actions if running_pre_actions else main_actions
         start_index = 0 if running_pre_actions else main_start_index
@@ -886,23 +1023,30 @@ def main():
             args.loops if args.loops is not None else MACRO.get("settings", {}).get("macro_loop_count", 1)
         )
         macro_loop_index = -1 if running_pre_actions else 0
+        loop_needs_initialization = not running_pre_actions
         index = start_index
         while macro_loop_index < macro_loop_count:
-            if index >= len(actions):
+            end_index = len(actions) if running_pre_actions else main_end_index
+            if index >= end_index:
                 if running_pre_actions:
                     running_pre_actions = False
                     actions = main_actions
                     start_index = main_start_index
                     runtime_state["last_image_found"] = None
                     macro_loop_index = 0
+                    loop_needs_initialization = True
                     index = start_index
                     continue
                 macro_loop_index += 1
                 if macro_loop_index >= macro_loop_count:
                     break
                 runtime_state["last_image_found"] = None
+                loop_needs_initialization = True
                 index = start_index
                 continue
+            if loop_needs_initialization:
+                begin_macro_loop()
+                loop_needs_initialization = False
             action = actions[index]
             next_index = index + 1
             if stop_event.is_set():
@@ -926,8 +1070,14 @@ def main():
                 if args.dry_run:
                     continue
 
-                params = action.get("params", {})
-                action_type = action["type"]
+                runtime_action = transform_action_coordinates(
+                    action,
+                    recorded_environment,
+                    current_bounds,
+                    coordinate_mode,
+                )
+                params = runtime_action.get("params", {})
+                action_type = runtime_action["type"]
                 if action_type == "wait":
                     seconds = float(params.get("seconds", action.get("duration", 0))) / speed
                     if not sleep_until(time.perf_counter() + seconds, stop_event):
@@ -996,13 +1146,13 @@ def main():
                         held_keys.pop()
                 elif action_type == "mouse_move":
                     start_time = time.perf_counter()
-                    for x, y, relative_time in interpolated_mouse_points(mouse_move_points(action)):
+                    for x, y, relative_time in interpolated_mouse_points(mouse_move_points(runtime_action)):
                         if not sleep_until(start_time + (relative_time / speed), stop_event):
                             print("Emergency stop requested", file=sys.stderr)
                             return 130
-                        mouse_controller.position = (int(x), int(y))
+                        position_mouse(mouse_controller, x, y)
                 elif action_type == "mouse_button":
-                    mouse_controller.position = (int(params.get("x", 0)), int(params.get("y", 0)))
+                    position_mouse(mouse_controller, params.get("x", 0), params.get("y", 0))
                     button = button_from_name(params.get("button", "left"), mouse)
                     phase = params.get("phase", "click")
                     if phase == "press":
@@ -1015,7 +1165,7 @@ def main():
                         mouse_controller.press(button)
                         mouse_controller.release(button)
                 elif action_type == "scroll":
-                    mouse_controller.position = (int(params.get("x", 0)), int(params.get("y", 0)))
+                    position_mouse(mouse_controller, params.get("x", 0), params.get("y", 0))
                     mouse_controller.scroll(int(params.get("dx", 0)), int(params.get("dy", 0)))
                 elif action_type == "image_click":
                     image_found = execute_image_click(params, mouse_controller, mouse, stop_event, held_buttons, speed)
