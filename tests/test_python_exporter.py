@@ -47,6 +47,8 @@ def test_python_export_contains_cli_options_and_macro_data(tmp_path):
     assert 'return sys.platform == "win32" and len(sys.argv) == 1' in text
     assert 'RUNTIME_DIR / f"{Path(__file__).stem}.log"' in text
     assert "traceback.print_exc()" in text
+    assert "pending_window_placement" in text
+    assert "Window placement reapplied after startup wait" in text
     main_text = text.split("def main():", 1)[1]
     assert main_text.index("set_dpi_awareness()") < main_text.index("hide_console_window()")
 
