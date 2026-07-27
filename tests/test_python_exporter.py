@@ -43,6 +43,7 @@ def test_python_export_contains_cli_options_and_macro_data(tmp_path):
     assert "--log-file" in text
     assert "is_dedicated_console_launch" in text
     assert "hide_console_window" in text
+    assert 'return sys.platform == "win32" and len(sys.argv) == 1' in text
     assert 'RUNTIME_DIR / f"{Path(__file__).stem}.log"' in text
     assert "traceback.print_exc()" in text
 

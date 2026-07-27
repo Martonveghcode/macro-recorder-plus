@@ -113,14 +113,8 @@ MACRO = json.loads(__MACRO_JSON__)
 
 
 def is_dedicated_console_launch():
-    """Return True for a no-argument Explorer launch with its own console."""
-    if sys.platform != "win32" or len(sys.argv) != 1:
-        return False
-    process_ids = (ctypes.c_ulong * 8)()
-    count = int(ctypes.windll.kernel32.GetConsoleProcessList(process_ids, len(process_ids)))
-    # Explorer -> py.exe -> python.exe normally has one or two attached processes.
-    # An existing PowerShell/cmd session adds at least one more, so do not hide it.
-    return 1 <= count <= 2 and bool(ctypes.windll.kernel32.GetConsoleWindow())
+    """Treat a no-argument Windows run as a double-click launch."""
+    return sys.platform == "win32" and len(sys.argv) == 1
 
 
 def hide_console_window():
