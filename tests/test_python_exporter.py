@@ -4,10 +4,16 @@ import py_compile
 import runpy
 import subprocess
 import sys
+from pathlib import Path
 
 from PIL import Image
 
-from macro_recorder_plus.exporters.python_exporter import ASSETS_DIR_NAME, RUNTIME_DIR_NAME, PythonExporter
+from macro_recorder_plus.exporters.python_exporter import (
+    ASSETS_DIR_NAME,
+    RUNTIME_DIR_NAME,
+    PythonExporter,
+    export_support_directory,
+)
 from macro_recorder_plus.models.actions import ActionType, MacroAction
 from macro_recorder_plus.models.environment import RecordedEnvironment, Rect
 from macro_recorder_plus.models.macro import MacroDocument
@@ -33,6 +39,12 @@ def test_python_export_contains_cli_options_and_macro_data(tmp_path):
     assert "transform_action_coordinates" in text
     assert "begin_macro_loop" in text
     assert "position_mouse" in text
+    assert "ensure_dependencies" in text
+    assert "--log-file" in text
+    assert "is_dedicated_console_launch" in text
+    assert "hide_console_window" in text
+    assert 'RUNTIME_DIR / f"{Path(__file__).stem}.log"' in text
+    assert "traceback.print_exc()" in text
 
 
 def test_python_export_is_valid_and_dry_run_does_not_need_pynput(tmp_path):
@@ -276,6 +288,28 @@ def test_python_export_writes_dependency_support_files(tmp_path):
     assert (path.parent / "run_exported.bat").exists()
     assert (path.parent / "README_exported_macros.txt").exists()
     assert "Secret actions read from environment variables" in (path.parent / "README_exported_macros.txt").read_text(encoding="utf-8")
+
+
+def test_desktop_export_keeps_only_python_file_visible_and_uses_misc_for_support(tmp_path):
+    desktop = tmp_path / "Desktop"
+    desktop.mkdir()
+    target = desktop / "news_macro.py"
+
+    path = PythonExporter().export(MacroDocument(name="news"), target)
+    support_dir = desktop / "misc"
+    text = path.read_text(encoding="utf-8")
+
+    assert export_support_directory(target) == support_dir
+    assert path == target
+    assert sorted(item.name for item in desktop.iterdir()) == ["misc", "news_macro.py"]
+    assert (support_dir / RUNTIME_DIR_NAME / "requirements.txt").exists()
+    assert (support_dir / RUNTIME_DIR_NAME / "install_dependencies.bat").exists()
+    assert (support_dir / "README_exported_macros.txt").exists()
+    assert target.exists()
+    assert not (desktop / "run_news_macro.bat").exists()
+    assert repr(str(Path("misc") / RUNTIME_DIR_NAME)) in text
+    assert "Missing export dependencies" in text
+    assert "Double-click the exported .py file" in (support_dir / "README_exported_macros.txt").read_text(encoding="utf-8")
 
 
 def test_python_export_uses_configured_python_in_batch_files(tmp_path):

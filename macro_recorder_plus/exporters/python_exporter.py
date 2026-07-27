@@ -65,12 +65,20 @@ def safe_batch_filename(script_path: Path) -> str:
     return f"run_{stem}.bat"
 
 
+def export_support_directory(target: str | Path) -> Path:
+    """Keep auxiliary export files out of the visible Desktop when possible."""
+    target = Path(target)
+    if target.parent.name.casefold() == "desktop":
+        return target.parent / "misc"
+    return target.parent
+
+
 class PythonExporter:
     def __init__(self, *, python_executable: str | Path | None = None) -> None:
         configured = str(python_executable).strip() if python_executable else ""
         self.python_executable = configured or str(Path(sys.executable))
 
-    def render(self, document: MacroDocument) -> str:
+    def render(self, document: MacroDocument, *, runtime_relative_path: str | Path = RUNTIME_DIR_NAME) -> str:
         payload = json.dumps(document.to_dict(), separators=(",", ":"), sort_keys=True)
         template = '''\
 #!/usr/bin/env python3
@@ -79,6 +87,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import importlib.util
 import json
 import math
 import os
@@ -86,19 +95,40 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import webbrowser
 from getpass import getpass
 from pathlib import Path
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-RUNTIME_DIR = SCRIPT_DIR / "__RUNTIME_DIR_NAME__"
+RUNTIME_DIR = SCRIPT_DIR / Path(__RUNTIME_RELATIVE_PATH__)
 LOCAL_DEPS = RUNTIME_DIR / "__DEPENDENCIES_DIR_NAME__"
 if LOCAL_DEPS.exists():
     sys.path.insert(0, str(LOCAL_DEPS))
 
 REQUIRED_PACKAGES = __REQUIRED_PACKAGES__
+REQUIRED_IMPORTS = ("pynput", "PIL", "numpy")
 MACRO = json.loads(__MACRO_JSON__)
+
+
+def is_dedicated_console_launch():
+    """Return True for a no-argument Explorer launch with its own console."""
+    if sys.platform != "win32" or len(sys.argv) != 1:
+        return False
+    process_ids = (ctypes.c_ulong * 8)()
+    count = int(ctypes.windll.kernel32.GetConsoleProcessList(process_ids, len(process_ids)))
+    # Explorer -> py.exe -> python.exe normally has one or two attached processes.
+    # An existing PowerShell/cmd session adds at least one more, so do not hide it.
+    return 1 <= count <= 2 and bool(ctypes.windll.kernel32.GetConsoleWindow())
+
+
+def hide_console_window():
+    if sys.platform != "win32":
+        return
+    hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+    if hwnd:
+        ctypes.windll.user32.ShowWindow(hwnd, 0)  # SW_HIDE
 
 
 def set_dpi_awareness():
@@ -231,13 +261,26 @@ def install_dependencies():
     return subprocess.call(command)
 
 
+def ensure_dependencies():
+    missing = [name for name in REQUIRED_IMPORTS if importlib.util.find_spec(name) is None]
+    if not missing:
+        return True
+    print(f"Missing export dependencies: {', '.join(missing)}")
+    if install_dependencies() != 0:
+        return False
+    if str(LOCAL_DEPS) not in sys.path:
+        sys.path.insert(0, str(LOCAL_DEPS))
+    importlib.invalidate_caches()
+    return all(importlib.util.find_spec(name) is not None for name in REQUIRED_IMPORTS)
+
+
 def import_input_modules():
     try:
         from pynput import keyboard, mouse
         return keyboard, mouse
     except Exception as exc:
         print(f"pynput is required: {exc}", file=sys.stderr)
-        print("Run the generated run_*.bat file, or run this script with --install-deps first.", file=sys.stderr)
+        print("Run this script with --install-deps first.", file=sys.stderr)
         return None, None
 
 
@@ -936,11 +979,26 @@ def main():
     parser.add_argument("--speed", type=float, default=None, help="Override the saved playback speed.")
     parser.add_argument("--loops", type=int, default=None, help="Override the saved whole-macro loop count.")
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--start-action", type=int, default=0)
+    parser.add_argument("--start-action", type=int, default=None)
     parser.add_argument("--end-action", type=int, default=None, help="Stop before this zero-based action index.")
     parser.add_argument("--install-deps", action="store_true", help="Install runtime dependencies into the local export folder.")
     parser.add_argument("--no-hotkey", action="store_true", help="Disable the F10 emergency-stop listener.")
+    parser.add_argument("--log-file", type=str, default="", help="Write console output to this file.")
     args = parser.parse_args()
+
+    dedicated_console = is_dedicated_console_launch()
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+    log_handle = None
+    log_file = args.log_file or (str(RUNTIME_DIR / f"{Path(__file__).stem}.log") if dedicated_console else "")
+    if log_file:
+        log_path = Path(log_file).expanduser()
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_handle = log_path.open("w", encoding="utf-8", buffering=1)
+        sys.stdout = log_handle
+        sys.stderr = log_handle
+    if dedicated_console:
+        hide_console_window()
 
     if args.install_deps:
         return install_dependencies()
@@ -963,6 +1021,9 @@ def main():
     mouse = None
 
     if not args.dry_run:
+        if not ensure_dependencies():
+            print("Unable to install the required export dependencies.", file=sys.stderr)
+            return 2
         keyboard, mouse = import_input_modules()
         if keyboard is None or mouse is None:
             return 2
@@ -1010,7 +1071,7 @@ def main():
         main_actions = MACRO["actions"]
         pre_actions = MACRO.get("pre_actions", [])
         runtime_state = {"last_image_found": None}
-        main_start_index = max(0, args.start_action)
+        main_start_index = max(0, args.start_action or 0)
         main_end_index = (
             len(main_actions)
             if args.end_action is None
@@ -1186,6 +1247,7 @@ def main():
         return 130
     except Exception as exc:
         print(f"Playback failed: {exc}", file=sys.stderr)
+        traceback.print_exc()
         return 1
     finally:
         if hotkey_listener is not None:
@@ -1194,6 +1256,11 @@ def main():
             except Exception:
                 pass
         release_all()
+        if log_handle is not None:
+            log_handle.flush()
+            sys.stdout = original_stdout
+            sys.stderr = original_stderr
+            log_handle.close()
 
 
 if __name__ == "__main__":
@@ -1201,7 +1268,7 @@ if __name__ == "__main__":
 '''
         return (
             dedent(template)
-            .replace("__RUNTIME_DIR_NAME__", RUNTIME_DIR_NAME)
+            .replace("__RUNTIME_RELATIVE_PATH__", repr(str(runtime_relative_path)))
             .replace("__DEPENDENCIES_DIR_NAME__", DEPENDENCIES_DIR_NAME)
             .replace("__REQUIRED_PACKAGES__", repr(list(RUNTIME_REQUIREMENTS)))
             .replace("__MACRO_JSON__", repr(payload))
@@ -1212,14 +1279,29 @@ if __name__ == "__main__":
         if target.suffix.lower() != ".py":
             target = target.with_suffix(".py")
         target.parent.mkdir(parents=True, exist_ok=True)
-        export_document = self._document_with_export_assets(document, target)
-        target.write_text(self.render(export_document), encoding="utf-8")
-        self.write_support_files(target)
+        return self._write_export(document, target, support_dir=export_support_directory(target))
+
+    def _write_export(self, document: MacroDocument, target: Path, *, support_dir: Path) -> Path:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        export_document = self._document_with_export_assets(document, target, support_dir=support_dir)
+        runtime_dir = support_dir / RUNTIME_DIR_NAME
+        runtime_relative_path = Path(os.path.relpath(runtime_dir, target.parent))
+        target.write_text(
+            self.render(export_document, runtime_relative_path=runtime_relative_path),
+            encoding="utf-8",
+        )
+        self.write_support_files(target, support_dir=support_dir)
         return target
 
-    def _document_with_export_assets(self, document: MacroDocument, target: Path) -> MacroDocument:
+    def _document_with_export_assets(
+        self,
+        document: MacroDocument,
+        target: Path,
+        *,
+        support_dir: Path | None = None,
+    ) -> MacroDocument:
         export_document = MacroDocument.from_dict(document.to_dict())
-        asset_dir = target.parent / ASSETS_DIR_NAME
+        asset_dir = (support_dir or target.parent) / ASSETS_DIR_NAME
         for action in [*export_document.pre_actions, *export_document.actions]:
             if action.type != ActionType.IMAGE_CLICK:
                 continue
@@ -1235,7 +1317,7 @@ if __name__ == "__main__":
             destination = self._unique_asset_path(asset_dir, source, action.id)
             if source.resolve() != destination.resolve():
                 shutil.copy2(source, destination)
-            action.params["image_path"] = str(Path(ASSETS_DIR_NAME) / destination.name)
+            action.params["image_path"] = os.path.relpath(destination, target.parent)
         return export_document
 
     def _unique_asset_path(self, asset_dir: Path, source: Path, action_id: str) -> Path:
@@ -1248,15 +1330,17 @@ if __name__ == "__main__":
             counter += 1
         return candidate
 
-    def write_support_files(self, target: str | Path) -> None:
+    def write_support_files(self, target: str | Path, *, support_dir: str | Path | None = None) -> None:
         target = Path(target)
-        runtime_dir = target.parent / RUNTIME_DIR_NAME
+        support_dir = Path(support_dir) if support_dir is not None else target.parent
+        runtime_dir = support_dir / RUNTIME_DIR_NAME
         runtime_dir.mkdir(parents=True, exist_ok=True)
         (runtime_dir / "requirements.txt").write_text("\n".join(RUNTIME_REQUIREMENTS) + "\n", encoding="utf-8")
         (runtime_dir / "install_dependencies.bat").write_text(self._install_batch(), encoding="utf-8")
-        (target.parent / safe_batch_filename(target)).write_text(self._run_batch(target), encoding="utf-8")
-        readme = target.parent / "README_exported_macros.txt"
-        readme.write_text(self._readme_text(), encoding="utf-8")
+        if support_dir == target.parent:
+            (target.parent / safe_batch_filename(target)).write_text(self._run_batch(target), encoding="utf-8")
+        readme = support_dir / "README_exported_macros.txt"
+        readme.write_text(self._readme_text(single_file=support_dir != target.parent), encoding="utf-8")
 
     def _install_batch(self) -> str:
         python_exe = str(Path(self.python_executable))
@@ -1296,7 +1380,25 @@ if __name__ == "__main__":
             f'"%PYTHON_EXE%" "%~dp0{target.name}" %*\n'
         )
 
-    def _readme_text(self) -> str:
+    def _readme_text(self, *, single_file: bool = False) -> str:
+        if single_file:
+            return dedent(
+                '''\
+                Macro Recorder + exported Python macros
+
+                Double-click the exported .py file on the Desktop. Required packages are installed
+                automatically into misc/macro_recorder_plus_runtime on first run.
+                Image recognition templates are stored under misc/macro_recorder_plus_assets.
+
+                Useful direct commands:
+                  python your_macro.py --dry-run
+                  python your_macro.py --speed 1.5
+                  python your_macro.py --start-action 12
+
+                Secret actions read from environment variables in this process.
+                Press F10 while a macro is running to request an emergency stop.
+                '''
+            )
         return dedent(
             '''\
             Macro Recorder + exported Python macros
