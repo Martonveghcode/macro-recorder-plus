@@ -3,7 +3,7 @@ from __future__ import annotations
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QToolButton
 
-from macro_recorder_plus.models.actions import ActionType, create_action
+from macro_recorder_plus.models.actions import ActionType, MacroAction, create_action
 from macro_recorder_plus.ui.action_properties import ActionProperties
 
 
@@ -165,6 +165,26 @@ def test_action_properties_emits_open_file_params(qtbot):
     assert updated.params["file_path"] == r"C:\TestData\notes.pdf"
     assert updated.params["target_monitor"] == "2"
     assert updated.params["auto_focus"] is True
+
+
+def test_open_url_properties_restore_window_placement_controls(qtbot):
+    widget = ActionProperties()
+    qtbot.addWidget(widget)
+    widget.set_action(
+        0,
+        MacroAction(
+            type=ActionType.OPEN_URL,
+            params={
+                "url": "https://example.com",
+                "auto_focus": True,
+                "window_placement": {"x": 10, "y": 20},
+            },
+        ),
+    )
+
+    assert "url" in widget.param_widgets
+    assert "auto_focus" in widget.param_widgets
+    assert "window_placement_status" in widget.param_widgets
 
 
 def test_action_properties_emits_launch_program_window_params(qtbot):

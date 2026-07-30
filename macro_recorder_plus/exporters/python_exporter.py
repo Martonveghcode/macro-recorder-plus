@@ -1289,8 +1289,6 @@ def main():
     mouse_controller = None
     keyboard = None
     mouse = None
-    pending_window_placement = None
-    pending_window_auto_focus = False
 
     if not args.dry_run:
         if not ensure_dependencies():
@@ -1443,25 +1441,13 @@ def main():
                     if not sleep_until(time.perf_counter() + seconds, stop_event):
                         print("Emergency stop requested", file=sys.stderr)
                         return 130
-                    if pending_window_placement:
-                        placement_restored = arrange_existing_window(
-                            pending_window_placement,
-                            auto_focus=pending_window_auto_focus,
-                            timeout=2.0,
-                        )
-                        print(f"Window placement reapplied after startup wait: {placement_restored}")
-                        pending_window_placement = None
-                        pending_window_auto_focus = False
                 elif action_type == "open_url":
                     webbrowser.open(params["url"])
                     if params.get("window_placement"):
-                        pending_window_placement = params["window_placement"]
-                        pending_window_auto_focus = bool(params.get("auto_focus", False))
-                        placement_applied = arrange_existing_window(
-                            pending_window_placement,
-                            auto_focus=pending_window_auto_focus,
+                        arrange_existing_window(
+                            params["window_placement"],
+                            auto_focus=bool(params.get("auto_focus", False)),
                         )
-                        print(f"Initial window placement applied: {placement_applied}")
                 elif action_type == "open_file":
                     open_file_with_default_app(
                         params.get("file_path", ""),

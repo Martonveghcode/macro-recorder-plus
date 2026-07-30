@@ -51,8 +51,8 @@ def test_python_export_contains_cli_options_and_macro_data(tmp_path):
     assert 'return sys.platform == "win32" and len(sys.argv) == 1' in text
     assert 'RUNTIME_DIR / f"{Path(__file__).stem}.log"' in text
     assert "traceback.print_exc()" in text
-    assert "pending_window_placement" in text
-    assert "Window placement reapplied after startup wait" in text
+    assert "pending_window_placement" not in text
+    assert "Window placement reapplied after startup wait" not in text
     main_text = text.split("def main():", 1)[1]
     assert main_text.index("set_dpi_awareness()") < main_text.index("hide_console_window()")
 
@@ -382,8 +382,16 @@ def test_python_export_supports_open_url_window_placement(tmp_path):
     text = path.read_text(encoding="utf-8")
 
     py_compile.compile(str(path), doraise=True)
-    assert "arrange_existing_window" in text
     assert "browser.exe" in text
+    main_text = text.split("def main():", 1)[1]
+    wait_block, open_url_and_after = main_text.split('elif action_type == "open_url":', 1)
+    open_url_block = open_url_and_after.split('elif action_type == "open_file":', 1)[0]
+    assert "arrange_existing_window(" not in wait_block.split('if action_type == "wait":', 1)[1]
+    assert open_url_block.count("arrange_existing_window(") == 1
+    assert 'params["window_placement"]' in open_url_block
+    assert 'webbrowser.open(params["url"])' in open_url_block
+    assert "pending_window_placement" not in main_text
+    assert "Window placement reapplied after startup wait" not in main_text
 
 
 def test_python_export_supports_if_image_result_dry_run(tmp_path):
