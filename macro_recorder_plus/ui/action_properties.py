@@ -22,9 +22,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from macro_recorder_plus.models.actions import ACTION_LABELS, DEFAULT_PARAMS, MAX_ACTION_LOOP_COUNT, ActionType, MacroAction
+from macro_recorder_plus.models.actions import ACTION_LABELS, DEFAULT_PARAMS, MAX_ACTION_LOOP_COUNT, ActionType, MacroAction, create_action
 from macro_recorder_plus.platform.windows_input import list_open_windows
-from macro_recorder_plus.ui.region_selector import RegionSelectionOverlay
+from macro_recorder_plus.ui.image_click_preview import ImageClickPreview
+from macro_recorder_plus.ui.region_selector import CircleSelectionOverlay, RegionSelectionOverlay
 
 
 FIELD_HELP: dict[str, tuple[str, str]] = {
@@ -98,11 +99,18 @@ FIELD_HELP: dict[str, tuple[str, str]] = {
         "Opens a transparent monitor overlay so you can drag a red box around the area where the image should be found.",
         "Click Select region, drag around the button area, then Apply.",
     ),
-    "image_click.movement_start_offset_x": ("Starts custom movement this many pixels horizontally from the matched image center.", "0 starts at the image center."),
-    "image_click.movement_start_offset_y": ("Starts custom movement this many pixels vertically from the matched image center.", "0 starts at the image center."),
-    "image_click.movement_end_offset_x": ("Ends custom movement this many pixels horizontally from the matched image center.", "80 ends 80 pixels to the right."),
-    "image_click.movement_end_offset_y": ("Ends custom movement this many pixels vertically from the matched image center.", "20 ends 20 pixels below the center."),
-    "image_click.movement_duration": ("Controls how long the custom mouse movement takes.", "0.500 moves over half a second."),
+    "image_click.natural_movement": ("Moves along a smooth, slightly curved route from a randomized start circle to a randomized click circle.", "Enable it to avoid identical pointer paths and click pixels."),
+    "image_click.movement_start_mode": ("Chooses whether the start circle follows the current pointer or uses a fixed point selected on screen.", "Selected screen circle can start around (800, 500) with a 100px radius."),
+    "image_click.movement_start_x": ("Sets the horizontal center of the selected start circle in physical screen pixels.", "800 centers the start area at X 800."),
+    "image_click.movement_start_y": ("Sets the vertical center of the selected start circle in physical screen pixels.", "500 centers the start area at Y 500."),
+    "image_click.movement_start_radius": ("Randomizes the movement start inside this radius around its center.", "100 chooses a different start within a 100px circle."),
+    "image_click.start_circle_picker": ("Shows the desktop with a red dot and radius so you can click the desired start center.", "Set a 100px radius, then click Pick start circle."),
+    "image_click.click_offset_x": ("Moves the red click-circle center horizontally relative to the found image center.", "0 keeps the target at the image center."),
+    "image_click.click_offset_y": ("Moves the red click-circle center vertically relative to the found image center.", "0 keeps the target at the image center."),
+    "image_click.click_radius": ("Randomly chooses the final stop and click pixel inside this circle.", "5 uses a five-pixel radius around the red dot."),
+    "image_click.path_variance": ("Adds a smooth human-like curve without random per-pixel jitter.", "8 creates a subtle wave up to roughly eight pixels."),
+    "image_click.click_preview": ("Shows the actual target image with the configured red click point and circle.", "A radius of 5 draws the possible final click area."),
+    "image_click.movement_duration": ("Controls how long the movement from the start circle to the click circle takes.", "0.750 moves over three quarters of a second."),
     "image_click.movement_button": ("Chooses which mouse button the custom movement uses.", "left"),
     "image_click.movement_button_action": (
         "Chooses whether the movement clicks, presses, releases, or holds the selected mouse button.",
@@ -140,6 +148,7 @@ class ActionProperties(QWidget):
         self._updating = False
         self.param_widgets: dict[str, QWidget] = {}
         self._region_overlay: RegionSelectionOverlay | None = None
+        self._circle_overlay: CircleSelectionOverlay | None = None
 
         layout = QVBoxLayout(self)
         self.empty_label = QLabel("No action selected")
@@ -147,6 +156,8 @@ class ActionProperties(QWidget):
 
         self.form_widget = QWidget()
         form = QFormLayout(self.form_widget)
+        form.setRowWrapPolicy(QFormLayout.WrapLongRows)
+        form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
         self.type_combo = QComboBox()
         for action_type, label in ACTION_LABELS.items():
             self.type_combo.addItem(label, action_type.value)
@@ -164,6 +175,8 @@ class ActionProperties(QWidget):
         self.duration_spin.setSingleStep(0.1)
         self.params_widget = QWidget()
         self.params_form = QFormLayout(self.params_widget)
+        self.params_form.setRowWrapPolicy(QFormLayout.WrapLongRows)
+        self.params_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
         self.apply_button = QPushButton("Apply")
 
         self._add_form_row(form, "Type", self.type_combo, "type")
@@ -221,7 +234,7 @@ class ActionProperties(QWidget):
         if self._updating or self._action is None:
             return
         action_type = ActionType(self.type_combo.currentData())
-        self._build_param_form(action_type, dict(DEFAULT_PARAMS[action_type]))
+        self._build_param_form(action_type, dict(create_action(action_type).params))
 
     def _build_param_form(self, action_type: ActionType, params: dict) -> None:
         self._clear_param_form()
@@ -322,39 +335,77 @@ class ActionProperties(QWidget):
                 self._add_int("region_width", "Region width", int(params.get("region_width", 0)), 0, 100000, "image_click.region_width")
                 self._add_int("region_height", "Region height", int(params.get("region_height", 0)), 0, 100000, "image_click.region_height")
                 self._add_region_picker()
-                start_offset = _pair_from_params(params, "movement_start_offset")
-                end_offset = _pair_from_params(params, "movement_end_offset")
-                self._add_int(
-                    "movement_start_offset_x",
-                    "Move start X offset",
-                    start_offset[0],
-                    -100000,
-                    100000,
-                    "image_click.movement_start_offset_x",
+                start_center = _pair_from_params(params, "movement_start_center")
+                click_offset = _pair_from_params(params, "click_offset")
+                self._add_bool(
+                    "natural_movement",
+                    "Natural randomized movement",
+                    bool(params.get("natural_movement", False)),
+                    "image_click.natural_movement",
+                )
+                self._add_choice_combo(
+                    "movement_start_mode",
+                    "Start area",
+                    [("Around current cursor", "cursor"), ("Selected screen circle", "screen")],
+                    str(params.get("movement_start_mode", "cursor")),
+                    "image_click.movement_start_mode",
                 )
                 self._add_int(
-                    "movement_start_offset_y",
-                    "Move start Y offset",
-                    start_offset[1],
+                    "movement_start_x",
+                    "Start center X",
+                    start_center[0],
                     -100000,
                     100000,
-                    "image_click.movement_start_offset_y",
+                    "image_click.movement_start_x",
                 )
                 self._add_int(
-                    "movement_end_offset_x",
-                    "Move end X offset",
-                    end_offset[0],
+                    "movement_start_y",
+                    "Start center Y",
+                    start_center[1],
                     -100000,
                     100000,
-                    "image_click.movement_end_offset_x",
+                    "image_click.movement_start_y",
                 )
                 self._add_int(
-                    "movement_end_offset_y",
-                    "Move end Y offset",
-                    end_offset[1],
+                    "movement_start_radius",
+                    "Start circle radius (px)",
+                    int(params.get("movement_start_radius", 100)),
+                    0,
+                    10000,
+                    "image_click.movement_start_radius",
+                )
+                self._add_start_circle_picker()
+                self._add_int(
+                    "click_offset_x",
+                    "Click center X offset",
+                    click_offset[0],
                     -100000,
                     100000,
-                    "image_click.movement_end_offset_y",
+                    "image_click.click_offset_x",
+                )
+                self._add_int(
+                    "click_offset_y",
+                    "Click center Y offset",
+                    click_offset[1],
+                    -100000,
+                    100000,
+                    "image_click.click_offset_y",
+                )
+                self._add_int(
+                    "click_radius",
+                    "Click circle radius (px)",
+                    int(params.get("click_radius", 5)),
+                    0,
+                    10000,
+                    "image_click.click_radius",
+                )
+                self._add_double(
+                    "path_variance",
+                    "Natural curve (px)",
+                    float(params.get("path_variance", 8.0)),
+                    0.0,
+                    1000.0,
+                    "image_click.path_variance",
                 )
                 self._add_double(
                     "movement_duration",
@@ -387,6 +438,7 @@ class ActionProperties(QWidget):
                     str(params.get("movement_button_action", "none")),
                     "image_click.movement_button_action",
                 )
+                self._add_click_preview()
             case ActionType.IF_CONDITION:
                 self._add_int(
                     "image_found_action",
@@ -464,14 +516,19 @@ class ActionProperties(QWidget):
                 params["on_not_found"] = self.param_widgets["on_not_found"].currentText()
                 for key in ["region_x", "region_y", "region_width", "region_height"]:
                     params[key] = self.param_widgets[key].value()
-                params["movement_start_offset"] = [
-                    self.param_widgets["movement_start_offset_x"].value(),
-                    self.param_widgets["movement_start_offset_y"].value(),
+                params["natural_movement"] = self.param_widgets["natural_movement"].isChecked()
+                params["movement_start_mode"] = str(self.param_widgets["movement_start_mode"].currentData() or "cursor")
+                params["movement_start_center"] = [
+                    self.param_widgets["movement_start_x"].value(),
+                    self.param_widgets["movement_start_y"].value(),
                 ]
-                params["movement_end_offset"] = [
-                    self.param_widgets["movement_end_offset_x"].value(),
-                    self.param_widgets["movement_end_offset_y"].value(),
+                params["movement_start_radius"] = self.param_widgets["movement_start_radius"].value()
+                params["click_offset"] = [
+                    self.param_widgets["click_offset_x"].value(),
+                    self.param_widgets["click_offset_y"].value(),
                 ]
+                params["click_radius"] = self.param_widgets["click_radius"].value()
+                params["path_variance"] = self.param_widgets["path_variance"].value()
                 params["movement_duration"] = self.param_widgets["movement_duration"].value()
                 params["movement_button"] = self.param_widgets["movement_button"].currentText()
                 params["movement_button_action"] = self.param_widgets["movement_button_action"].currentText()
@@ -535,6 +592,32 @@ class ActionProperties(QWidget):
         layout.addWidget(button)
         layout.addStretch(1)
         self._add_param_row("Region picker", row, "image_click.region_picker")
+
+    def _add_start_circle_picker(self) -> None:
+        row = QWidget()
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        button = QPushButton("Pick start circle on screen")
+        button.setToolTip("Preview the configured radius in red and click its center")
+        button.clicked.connect(self._select_start_circle)
+        layout.addWidget(button)
+        layout.addStretch(1)
+        self._add_param_row("Start circle picker", row, "image_click.start_circle_picker")
+
+    def _add_click_preview(self) -> None:
+        preview = ImageClickPreview()
+        self.param_widgets["click_preview"] = preview
+        self._add_param_row("Click circle preview", preview, "image_click.click_preview")
+        image_path = self.param_widgets.get("image_path")
+        offset_x = self.param_widgets.get("click_offset_x")
+        offset_y = self.param_widgets.get("click_offset_y")
+        radius = self.param_widgets.get("click_radius")
+        if isinstance(image_path, QLineEdit):
+            image_path.textChanged.connect(self._refresh_click_preview)
+        for widget in (offset_x, offset_y, radius):
+            if isinstance(widget, QSpinBox):
+                widget.valueChanged.connect(self._refresh_click_preview)
+        self._refresh_click_preview()
 
     def _add_window_placement_picker(self, placement: object, help_key: str) -> None:
         row = QWidget()
@@ -617,6 +700,45 @@ class ActionProperties(QWidget):
         self.param_widgets["region_width"].setValue(max(0, int(width)))
         self.param_widgets["region_height"].setValue(max(0, int(height)))
 
+    def _select_start_circle(self) -> None:
+        required = {"movement_start_x", "movement_start_y", "movement_start_radius", "movement_start_mode"}
+        if not required.issubset(self.param_widgets):
+            return
+        center = (
+            self.param_widgets["movement_start_x"].value(),
+            self.param_widgets["movement_start_y"].value(),
+        )
+        overlay = CircleSelectionOverlay(self.param_widgets["movement_start_radius"].value(), center)
+        overlay.pointSelected.connect(self._set_start_circle_center)
+        overlay.cancelled.connect(lambda: setattr(self, "_circle_overlay", None))
+        overlay.destroyed.connect(lambda: setattr(self, "_circle_overlay", None))
+        self._circle_overlay = overlay
+        overlay.show()
+
+    def _set_start_circle_center(self, x: int, y: int) -> None:
+        if not {"movement_start_x", "movement_start_y", "movement_start_mode"}.issubset(self.param_widgets):
+            return
+        self.param_widgets["movement_start_x"].setValue(int(x))
+        self.param_widgets["movement_start_y"].setValue(int(y))
+        mode = self.param_widgets["movement_start_mode"]
+        if isinstance(mode, QComboBox):
+            index = mode.findData("screen")
+            if index >= 0:
+                mode.setCurrentIndex(index)
+
+    def _refresh_click_preview(self, *_args) -> None:
+        required = {"click_preview", "image_path", "click_offset_x", "click_offset_y", "click_radius"}
+        if not required.issubset(self.param_widgets):
+            return
+        preview = self.param_widgets["click_preview"]
+        if not isinstance(preview, ImageClickPreview):
+            return
+        preview.set_preview(
+            self.param_widgets["image_path"].text(),
+            (self.param_widgets["click_offset_x"].value(), self.param_widgets["click_offset_y"].value()),
+            self.param_widgets["click_radius"].value(),
+        )
+
     def _add_line(self, key: str, label: str, value: str, help_key: str) -> None:
         widget = QLineEdit(value)
         self.param_widgets[key] = widget
@@ -677,6 +799,23 @@ class ActionProperties(QWidget):
         widget = QComboBox()
         widget.addItems(choices)
         index = widget.findText(value)
+        if index >= 0:
+            widget.setCurrentIndex(index)
+        self.param_widgets[key] = widget
+        self._add_param_row(label, widget, help_key)
+
+    def _add_choice_combo(
+        self,
+        key: str,
+        label: str,
+        choices: list[tuple[str, str]],
+        value: str,
+        help_key: str,
+    ) -> None:
+        widget = QComboBox()
+        for display, data in choices:
+            widget.addItem(display, data)
+        index = widget.findData(value)
         if index >= 0:
             widget.setCurrentIndex(index)
         self.param_widgets[key] = widget

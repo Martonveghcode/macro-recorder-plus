@@ -249,7 +249,10 @@ def locate_image_in_image(
 def _grab_screen(image_grab_module: Any, region: tuple[int, int, int, int] | None) -> tuple[Any, int, int]:
     if region is not None:
         x, y, width, height = region
-        screenshot = image_grab_module.grab(bbox=(x, y, x + width, y + height))
+        try:
+            screenshot = image_grab_module.grab(bbox=(x, y, x + width, y + height), all_screens=True)
+        except TypeError:
+            screenshot = image_grab_module.grab(bbox=(x, y, x + width, y + height))
         return screenshot, int(x), int(y)
 
     try:
