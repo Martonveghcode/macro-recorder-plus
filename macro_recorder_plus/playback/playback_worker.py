@@ -16,7 +16,11 @@ from macro_recorder_plus.platform.windows_input import (
     position_mouse,
 )
 from macro_recorder_plus.playback.safety_controller import SafetyController
-from macro_recorder_plus.utilities.mouse_path import humanized_path_points, interpolated_path_points
+from macro_recorder_plus.utilities.mouse_path import (
+    humanized_path_points,
+    image_chain_transition_points,
+    interpolated_path_points,
+)
 from macro_recorder_plus.utilities.timing import scaled_delay
 
 MOUSE_PLAYBACK_HZ = 60
@@ -171,6 +175,7 @@ class PlaybackWorker(QObject):
         context_label: str = "playback",
     ) -> tuple[bool, int]:
         index = start_index
+        previous_successful_image_index: int | None = None
         while lower_bound <= index < end_index:
             action = actions[index]
             next_index = index + 1
@@ -181,9 +186,12 @@ class PlaybackWorker(QObject):
                     self._last_image_found = None
                 if action.type == ActionType.MOUSE_MOVE:
                     self._clear_humanized_mouse_destination()
+                previous_successful_image_index = None
                 index = next_index
                 continue
-            for _loop_index in range(clamp_loop_count(action.loop_count)):
+            image_found_for_action: bool | None = None
+            chain_from_previous_image = previous_successful_image_index == index - 1
+            for action_loop_index in range(clamp_loop_count(action.loop_count)):
                 if self._wait_while_paused_or_stopped(mouse_controller):
                     return False, index
                 action_delay = action.delay if self.respect_action_delays else 0.0
@@ -202,10 +210,16 @@ class PlaybackWorker(QObject):
                             return False, index
                     elif action.type == ActionType.IMAGE_CLICK:
                         self._clear_humanized_mouse_destination()
-                        image_found = self._play_image_click(transformed_action, executor, mouse_controller)
+                        image_found = self._play_image_click(
+                            transformed_action,
+                            executor,
+                            mouse_controller,
+                            chain_from_previous_image=(chain_from_previous_image and action_loop_index == 0),
+                        )
                         if image_found is None:
                             return False, index
                         self._last_image_found = image_found
+                        image_found_for_action = image_found
                     elif action.type == ActionType.IF_CONDITION:
                         jump_index = self._conditional_jump_index(action, len(actions))
                         if jump_index is not None:
@@ -219,6 +233,15 @@ class PlaybackWorker(QObject):
                 progress_signal.emit(index, action)
                 if next_index != index + 1:
                     break
+            previous_successful_image_index = (
+                index
+                if (
+                    action.type == ActionType.IMAGE_CLICK
+                    and bool(action.params.get("natural_movement", False))
+                    and image_found_for_action is True
+                )
+                else None
+            )
             index = next_index
         return True, index
 
@@ -300,7 +323,14 @@ class PlaybackWorker(QObject):
         self._humanized_mouse_source = None
         self._humanized_mouse_destination = None
 
-    def _play_image_click(self, action: MacroAction, executor: ActionExecutor, mouse_controller: object) -> bool | None:
+    def _play_image_click(
+        self,
+        action: MacroAction,
+        executor: ActionExecutor,
+        mouse_controller: object,
+        *,
+        chain_from_previous_image: bool = False,
+    ) -> bool | None:
         def stop_check() -> bool:
             if self._paused:
                 return self._wait_while_paused_or_stopped(mouse_controller)
@@ -316,7 +346,13 @@ class PlaybackWorker(QObject):
         click_action = str(action.params.get("click_action", "left_click"))
         natural_movement = bool(action.params.get("natural_movement", False))
         if natural_movement or click_action == "custom_movement":
-            result = self._play_image_custom_movement(action, match, executor, mouse_controller)
+            result = self._play_image_custom_movement(
+                action,
+                match,
+                executor,
+                mouse_controller,
+                chain_from_previous_image=chain_from_previous_image and natural_movement,
+            )
             if result is not True:
                 return result
             if natural_movement and click_action not in {"move_only", "custom_movement"}:
@@ -331,6 +367,8 @@ class PlaybackWorker(QObject):
         match: object,
         executor: ActionExecutor,
         mouse_controller: object,
+        *,
+        chain_from_previous_image: bool = False,
     ) -> bool | None:
         current_position = getattr(mouse_controller, "position", None)
         start_position = None
@@ -348,7 +386,19 @@ class PlaybackWorker(QObject):
         if not interpolated_points:
             return True
         first_x, first_y, _ = interpolated_points[0]
-        position_mouse(mouse_controller, int(first_x), int(first_y))
+        if chain_from_previous_image and start_position is not None:
+            transition_points = image_chain_transition_points(start_position, (int(first_x), int(first_y)))
+            transition_points = [
+                (*clamp_point(x, y, self.current_environment.virtual_desktop), relative_time)
+                for x, y, relative_time in transition_points
+            ]
+            transition_started = time.perf_counter()
+            for x, y, relative_time in transition_points[1:]:
+                if not self._wait_until(transition_started + (relative_time / self.speed), mouse_controller):
+                    return None
+                position_mouse(mouse_controller, int(x), int(y))
+        else:
+            position_mouse(mouse_controller, int(first_x), int(first_y))
         apply_movement_button = str(action.params.get("click_action", "left_click")) == "custom_movement"
         if apply_movement_button:
             executor.apply_image_movement_button(action, "start")

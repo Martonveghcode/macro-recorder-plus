@@ -821,7 +821,15 @@ def best_sampled_candidates(screen_array, template_array, candidate_rows, candid
     return candidate_rows[best_indexes], candidate_cols[best_indexes]
 
 
-def execute_image_click(params, mouse_controller, mouse, stop_event=None, held_buttons=None, speed=1.0):
+def execute_image_click(
+    params,
+    mouse_controller,
+    mouse,
+    stop_event=None,
+    held_buttons=None,
+    speed=1.0,
+    chain_from_previous_image=False,
+):
     match = find_image_on_screen(params, stop_event=stop_event)
     if match is None:
         if stop_event is not None and stop_event.is_set():
@@ -842,6 +850,7 @@ def execute_image_click(params, mouse_controller, mouse, stop_event=None, held_b
             held_buttons=held_buttons,
             speed=speed,
             apply_movement_button=click_action == "custom_movement",
+            chain_from_previous_image=chain_from_previous_image,
         )
         if stop_event is not None and stop_event.is_set():
             return None
@@ -887,13 +896,15 @@ def execute_image_movement(
     held_buttons=None,
     speed=1.0,
     apply_movement_button=True,
+    chain_from_previous_image=False,
 ):
     current_position = getattr(mouse_controller, "position", match["center"])
+    current_bounds = current_virtual_desktop()
     points = image_movement_points(
         params,
         match,
         start_position=(int(current_position[0]), int(current_position[1])),
-        current_bounds=current_virtual_desktop(),
+        current_bounds=current_bounds,
     )
     if not points:
         return
@@ -901,7 +912,25 @@ def execute_image_movement(
     if not interpolated_points:
         return
     first_x, first_y, _ = interpolated_points[0]
-    position_mouse(mouse_controller, first_x, first_y)
+    if chain_from_previous_image:
+        transition_points = image_chain_transition_points(
+            (int(current_position[0]), int(current_position[1])),
+            (first_x, first_y),
+            current_bounds=current_bounds,
+        )
+        transition_started = time.perf_counter()
+        for x, y, relative_time in transition_points[1:]:
+            target = transition_started + (relative_time / max(0.01, speed))
+            if stop_event is not None:
+                if not sleep_until(target, stop_event):
+                    return
+            else:
+                remaining = target - time.perf_counter()
+                if remaining > 0:
+                    time.sleep(remaining)
+            position_mouse(mouse_controller, x, y)
+    else:
+        position_mouse(mouse_controller, first_x, first_y)
     if apply_movement_button:
         apply_image_movement_button(params, mouse_controller, mouse, "start", held_buttons)
     start_time = time.perf_counter()
@@ -960,6 +989,25 @@ def image_movement_points(params, match, start_position=None, current_bounds=Non
         (center_x + start_offset[0], center_y + start_offset[1], 0.0),
         (center_x + end_offset[0], center_y + end_offset[1], duration),
     ]
+
+
+def image_chain_transition_points(start, end, current_bounds=None, rng=None):
+    random_source = rng or random
+    duration = random_source.uniform(0.3, 0.8)
+    points = humanized_mouse_points(
+        [
+            (int(start[0]), int(start[1]), 0.0),
+            (int(end[0]), int(end[1]), duration),
+        ],
+        endpoint_radius=0,
+        path_variance=4.0,
+        timing_variance_min=0.0,
+        timing_variance_max=0.0,
+        rng=random_source,
+    )
+    if current_bounds is not None:
+        return [(*clamp_point(x, y, current_bounds), relative_time) for x, y, relative_time in points]
+    return points
 
 
 def offset_pair(value):
@@ -1280,6 +1328,7 @@ def main():
         release_all()
         runtime_state["humanized_mouse_source"] = None
         runtime_state["humanized_mouse_destination"] = None
+        runtime_state["previous_natural_image_index"] = None
         if args.dry_run or mouse_controller is None:
             return
         cursor_start = recorded_environment.get("cursor_start")
@@ -1300,6 +1349,7 @@ def main():
             "last_image_found": None,
             "humanized_mouse_source": None,
             "humanized_mouse_destination": None,
+            "previous_natural_image_index": None,
         }
         main_start_index = max(0, args.start_action or 0)
         main_end_index = (
@@ -1329,6 +1379,7 @@ def main():
                     actions = main_actions
                     start_index = main_start_index
                     runtime_state["last_image_found"] = None
+                    runtime_state["previous_natural_image_index"] = None
                     macro_loop_index = 0
                     loop_needs_initialization = True
                     index = start_index
@@ -1343,6 +1394,7 @@ def main():
                         print("Emergency stop requested", file=sys.stderr)
                         return 130
                 runtime_state["last_image_found"] = None
+                runtime_state["previous_natural_image_index"] = None
                 loop_needs_initialization = True
                 index = start_index
                 continue
@@ -1360,9 +1412,12 @@ def main():
                 if action.get("type") == "mouse_move":
                     runtime_state["humanized_mouse_source"] = None
                     runtime_state["humanized_mouse_destination"] = None
+                runtime_state["previous_natural_image_index"] = None
                 index = next_index
                 continue
-            for _loop_index in range(clamp_loop_count(action.get("loop_count", 1))):
+            image_found_for_action = None
+            chain_from_previous_image = runtime_state.get("previous_natural_image_index") == index - 1
+            for action_loop_index in range(clamp_loop_count(action.get("loop_count", 1))):
                 if stop_event.is_set():
                     print("Emergency stop requested", file=sys.stderr)
                     return 130
@@ -1503,17 +1558,35 @@ def main():
                 elif action_type == "image_click":
                     runtime_state["humanized_mouse_source"] = None
                     runtime_state["humanized_mouse_destination"] = None
-                    image_found = execute_image_click(params, mouse_controller, mouse, stop_event, held_buttons, speed)
+                    image_found = execute_image_click(
+                        params,
+                        mouse_controller,
+                        mouse,
+                        stop_event,
+                        held_buttons,
+                        speed,
+                        chain_from_previous_image=(chain_from_previous_image and action_loop_index == 0),
+                    )
                     if image_found is None:
                         print("Emergency stop requested", file=sys.stderr)
                         return 130
                     runtime_state["last_image_found"] = bool(image_found)
+                    image_found_for_action = bool(image_found)
                 elif action_type == "if_condition":
                     jump_index = conditional_jump_target(params, runtime_state, len(actions))
                     if jump_index is not None:
                         print(f"If Image Result jumped to action {jump_index + 1}")
                         next_index = jump_index
                         break
+            runtime_state["previous_natural_image_index"] = (
+                index
+                if (
+                    action.get("type") == "image_click"
+                    and bool(action.get("params", {}).get("natural_movement", False))
+                    and image_found_for_action is True
+                )
+                else None
+            )
             index = next_index
         return 0
     except KeyboardInterrupt:

@@ -11,6 +11,9 @@ HUMANIZED_ENDPOINT_RADIUS = 5
 HUMANIZED_PATH_VARIANCE = 2.0
 HUMANIZED_TIMING_VARIANCE_MIN = 0.1
 HUMANIZED_TIMING_VARIANCE_MAX = 0.2
+IMAGE_CHAIN_TRANSITION_DURATION_MIN = 0.3
+IMAGE_CHAIN_TRANSITION_DURATION_MAX = 0.8
+IMAGE_CHAIN_TRANSITION_PATH_VARIANCE = 4.0
 
 
 def simplify_path(points: Sequence[Point], tolerance: float) -> list[Point]:
@@ -140,6 +143,32 @@ def humanized_path_points(
         varied_duration,
     )
     return output
+
+
+def image_chain_transition_points(
+    start: tuple[int, int],
+    end: tuple[int, int],
+    *,
+    rng: Any | None = None,
+) -> list[Point]:
+    """Build the short natural bridge between consecutive image actions."""
+    random_source = rng or random
+    duration = random_source.uniform(
+        IMAGE_CHAIN_TRANSITION_DURATION_MIN,
+        IMAGE_CHAIN_TRANSITION_DURATION_MAX,
+    )
+    return humanized_path_points(
+        [
+            (int(start[0]), int(start[1]), 0.0),
+            (int(end[0]), int(end[1]), duration),
+        ],
+        hz=60,
+        endpoint_radius=0,
+        path_variance=IMAGE_CHAIN_TRANSITION_PATH_VARIANCE,
+        timing_variance_min=0.0,
+        timing_variance_max=0.0,
+        rng=random_source,
+    )
 
 
 def random_circle_offset(radius: int, rng: Any | None = None) -> tuple[int, int]:

@@ -85,6 +85,8 @@ New image-click actions can use circle-based natural movement:
 
 `movement_start_mode` is `cursor` or `screen`. The start point is chosen inside `movement_start_radius` around the current cursor or `movement_start_center`. The final point is chosen inside `click_radius` around the matched image center plus `click_offset`. `path_variance` adds a smooth curved deviation rather than per-pixel jitter. Imported actions without `natural_movement` retain their previous exact or legacy custom-offset behavior.
 
+When two enabled image-click actions with natural movement run consecutively, playback automatically bridges the first click point to the next randomized start-circle point with a smooth 0.3 to 0.8 second transition. Three consecutive image actions produce two bridges. This behavior has no separate macro setting and does not affect a standalone image action or legacy actions without `natural_movement`.
+
 Secret input actions store only an environment variable name:
 
 ```json
