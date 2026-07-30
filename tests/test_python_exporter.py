@@ -1,16 +1,26 @@
 from __future__ import annotations
 
+import math
 import py_compile
+import random
 import runpy
 import subprocess
 import sys
+from pathlib import Path
 
 from PIL import Image
 
-from macro_recorder_plus.exporters.python_exporter import ASSETS_DIR_NAME, RUNTIME_DIR_NAME, PythonExporter
+from macro_recorder_plus.exporters.python_exporter import (
+    ASSETS_DIR_NAME,
+    RUNTIME_DIR_NAME,
+    PythonExporter,
+    export_support_directory,
+)
 from macro_recorder_plus.models.actions import ActionType, MacroAction
 from macro_recorder_plus.models.environment import RecordedEnvironment, Rect
 from macro_recorder_plus.models.macro import MacroDocument
+from macro_recorder_plus.platform.windows_input import image_movement_points_for_match
+from macro_recorder_plus.utilities.mouse_path import humanized_path_points
 
 
 def test_python_export_contains_cli_options_and_macro_data(tmp_path):
@@ -28,11 +38,23 @@ def test_python_export_contains_cli_options_and_macro_data(tmp_path):
     assert "<f10>" in text
     assert "WEBSITE_PASSWORD" in text
     assert "set_dpi_awareness" in text
+    assert "SetThreadDpiAwarenessContext" in text
     assert "interpolated_mouse_points" in text
     assert "mouse_move_points" in text
     assert "transform_action_coordinates" in text
     assert "begin_macro_loop" in text
     assert "position_mouse" in text
+    assert "ensure_dependencies" in text
+    assert "--log-file" in text
+    assert "is_dedicated_console_launch" in text
+    assert "hide_console_window" in text
+    assert 'return sys.platform == "win32" and len(sys.argv) == 1' in text
+    assert 'RUNTIME_DIR / f"{Path(__file__).stem}.log"' in text
+    assert "traceback.print_exc()" in text
+    assert "pending_window_placement" in text
+    assert "Window placement reapplied after startup wait" in text
+    main_text = text.split("def main():", 1)[1]
+    assert main_text.index("set_dpi_awareness()") < main_text.index("hide_console_window()")
 
 
 def test_python_export_is_valid_and_dry_run_does_not_need_pynput(tmp_path):
@@ -100,6 +122,34 @@ def test_python_export_dry_run_repeats_whole_macro_and_allows_override(tmp_path)
     assert saved_result.stdout.count("0: comment") == 3
     assert override_result.returncode == 0
     assert override_result.stdout.count("0: comment") == 2
+
+
+def test_python_export_uses_saved_random_delay_between_whole_macro_loops(tmp_path):
+    document = MacroDocument(
+        name="paced export",
+        settings={
+            "playback_speed": 1.0,
+            "coordinate_mode": "exact",
+            "macro_loop_count": 3,
+            "macro_loop_delay_mode": "random",
+            "macro_loop_delay_min": 1.0,
+            "macro_loop_delay_max": 2.0,
+        },
+        actions=[MacroAction(type=ActionType.COMMENT, params={"text": "check"})],
+    )
+    path = PythonExporter().export(document, tmp_path / "paced.py")
+    exported = runpy.run_path(str(path))
+
+    assert exported["macro_loop_delay_range"](exported["MACRO"]["settings"]) == (1.0, 2.0)
+    result = subprocess.run(
+        [sys.executable, str(path), "--dry-run"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert result.stdout.count("Waiting ") == 2
 
 
 def test_python_export_can_limit_playback_to_an_action_range(tmp_path):
@@ -174,6 +224,82 @@ def test_python_export_coordinate_transform_and_verified_mouse_match_app(tmp_pat
     assert transformed == (0, 100)
     assert exported["position_mouse"](mouse, 500, -200) == (500, -200)
     assert mouse.assignments == 3
+
+
+def test_python_export_humanizes_only_tagged_mouse_moves_and_keeps_click_at_varied_destination(tmp_path):
+    document = MacroDocument(
+        name="humanized export",
+        actions=[
+            MacroAction(
+                type=ActionType.MOUSE_MOVE,
+                timestamp=0.0,
+                duration=1.0,
+                params={
+                    "start": [0, 0],
+                    "end": [100, 0],
+                    "path": [[0, 0, 0.0], [100, 0, 1.0]],
+                    "humanize_playback": True,
+                },
+            )
+        ],
+    )
+    path = PythonExporter().export(document, tmp_path / "humanized.py")
+    exported = runpy.run_path(str(path))
+    action = exported["MACRO"]["actions"][0]
+    bounds = {"left": -1000, "top": -1000, "right": 1000, "bottom": 1000}
+
+    varied = exported["playback_mouse_points"](action, bounds, rng=random.Random(7))
+    legacy_action = {**action, "params": {**action["params"]}}
+    legacy_action["params"].pop("humanize_playback")
+    legacy = exported["playback_mouse_points"](legacy_action, bounds, rng=random.Random(7))
+    app_varied = humanized_path_points([(0, 0, 0.0), (100, 0, 1.0)], rng=random.Random(7))
+    destination = varied[-1][:2]
+    state = {
+        "humanized_mouse_source": (100, 0),
+        "humanized_mouse_destination": destination,
+    }
+
+    assert math.hypot(destination[0] - 100, destination[1]) <= 5
+    assert 0.1 <= abs(varied[-1][2] - 1.0) <= 0.2
+    assert legacy[-1] == (100, 0, 1.0)
+    assert varied == app_varied
+    assert exported["resolved_mouse_target"]({"x": 100, "y": 0}, state) == destination
+
+
+def test_python_export_preserves_natural_image_start_and_click_circles(tmp_path):
+    action = MacroAction(
+        type=ActionType.IMAGE_CLICK,
+        params={
+            "natural_movement": True,
+            "movement_start_mode": "screen",
+            "movement_start_center": [400, 300],
+            "movement_start_radius": 100,
+            "click_offset": [3, -2],
+            "click_radius": 5,
+            "path_variance": 8.0,
+            "movement_duration": 0.75,
+        },
+    )
+    path = PythonExporter().export(MacroDocument(name="image circles", actions=[action]), tmp_path / "image_circles.py")
+    exported = runpy.run_path(str(path))
+    params = exported["MACRO"]["actions"][0]["params"]
+    bounds_dict = {"left": 0, "top": 0, "right": 1920, "bottom": 1080}
+    exported_points = exported["image_movement_points"](
+        params,
+        {"center": (800, 500)},
+        start_position=(10, 10),
+        current_bounds=bounds_dict,
+        rng=random.Random(7),
+    )
+    app_points = image_movement_points_for_match(
+        action,
+        type("Match", (), {"center": (800, 500)})(),
+        start_position=(10, 10),
+        bounds=Rect(0, 0, 1920, 1080),
+        rng=random.Random(7),
+    )
+
+    assert exported_points == app_points
 
 
 def test_python_export_runs_pre_actions_once_before_looped_actions(tmp_path):
@@ -276,6 +402,28 @@ def test_python_export_writes_dependency_support_files(tmp_path):
     assert (path.parent / "run_exported.bat").exists()
     assert (path.parent / "README_exported_macros.txt").exists()
     assert "Secret actions read from environment variables" in (path.parent / "README_exported_macros.txt").read_text(encoding="utf-8")
+
+
+def test_desktop_export_keeps_only_python_file_visible_and_uses_misc_for_support(tmp_path):
+    desktop = tmp_path / "Desktop"
+    desktop.mkdir()
+    target = desktop / "news_macro.py"
+
+    path = PythonExporter().export(MacroDocument(name="news"), target)
+    support_dir = desktop / "misc"
+    text = path.read_text(encoding="utf-8")
+
+    assert export_support_directory(target) == support_dir
+    assert path == target
+    assert sorted(item.name for item in desktop.iterdir()) == ["misc", "news_macro.py"]
+    assert (support_dir / RUNTIME_DIR_NAME / "requirements.txt").exists()
+    assert (support_dir / RUNTIME_DIR_NAME / "install_dependencies.bat").exists()
+    assert (support_dir / "README_exported_macros.txt").exists()
+    assert target.exists()
+    assert not (desktop / "run_news_macro.bat").exists()
+    assert repr(str(Path("misc") / RUNTIME_DIR_NAME)) in text
+    assert "Missing export dependencies" in text
+    assert "Double-click the exported .py file" in (support_dir / "README_exported_macros.txt").read_text(encoding="utf-8")
 
 
 def test_python_export_uses_configured_python_in_batch_files(tmp_path):

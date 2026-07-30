@@ -12,10 +12,10 @@ from typing import Any, Callable
 
 from macro_recorder_plus.models.actions import ActionType, MacroAction
 from macro_recorder_plus.models.environment import MonitorInfo
-from macro_recorder_plus.platform.windows_monitors import get_monitor_layout
+from macro_recorder_plus.platform.windows_monitors import clamp_point, get_monitor_layout
 from macro_recorder_plus.utilities.image_recognition import ImageMatch, find_image_on_screen
 from macro_recorder_plus.utilities.key_sequences import normalize_key_name
-from macro_recorder_plus.utilities.mouse_path import interpolated_path_points
+from macro_recorder_plus.utilities.mouse_path import humanized_path_points, interpolated_path_points, random_circle_offset
 from macro_recorder_plus.utilities.validation import validate_url
 
 
@@ -290,12 +290,24 @@ class ActionExecutor:
         self.click_image_match(action, match)
 
     def click_image_match(self, action: MacroAction, match: ImageMatch) -> None:
-        position_mouse(self.mouse, int(match.center[0]), int(match.center[1]))
         click_action = str(action.params.get("click_action", "left_click"))
+        if bool(action.params.get("natural_movement", False)):
+            self.perform_image_movement(action, match, apply_movement_button=click_action == "custom_movement")
+            if click_action in {"move_only", "custom_movement"}:
+                return
+            self.apply_image_click_at_current_position(action)
+            return
+        position_mouse(self.mouse, int(match.center[0]), int(match.center[1]))
         if click_action == "move_only":
             return
         if click_action == "custom_movement":
             self.perform_image_movement(action, match)
+            return
+        self.apply_image_click_at_current_position(action)
+
+    def apply_image_click_at_current_position(self, action: MacroAction) -> None:
+        click_action = str(action.params.get("click_action", "left_click"))
+        if click_action in {"move_only", "custom_movement"}:
             return
         if click_action == "double_click":
             button = name_to_mouse_button("left")
@@ -310,8 +322,20 @@ class ActionExecutor:
         self.mouse.press(button)
         self.mouse.release(button)
 
-    def perform_image_movement(self, action: MacroAction, match: ImageMatch) -> None:
-        points = image_movement_points_for_match(action, match)
+    def perform_image_movement(
+        self,
+        action: MacroAction,
+        match: ImageMatch,
+        *,
+        apply_movement_button: bool = True,
+    ) -> None:
+        current_position = getattr(self.mouse, "position", match.center)
+        points = image_movement_points_for_match(
+            action,
+            match,
+            start_position=(int(current_position[0]), int(current_position[1])),
+            bounds=get_monitor_layout().virtual_desktop,
+        )
         if not points:
             return
         interpolated_points = interpolated_path_points(points, hz=60)
@@ -319,7 +343,8 @@ class ActionExecutor:
             return
         first_x, first_y, _ = interpolated_points[0]
         position_mouse(self.mouse, int(first_x), int(first_y))
-        self.apply_image_movement_button(action, "start")
+        if apply_movement_button:
+            self.apply_image_movement_button(action, "start")
         start_time = time.perf_counter()
         for x, y, relative_time in interpolated_points[1:]:
             target = start_time + max(0.0, float(relative_time))
@@ -327,7 +352,8 @@ class ActionExecutor:
             if remaining > 0:
                 time.sleep(remaining)
             position_mouse(self.mouse, int(x), int(y))
-        self.apply_image_movement_button(action, "end")
+        if apply_movement_button:
+            self.apply_image_movement_button(action, "end")
 
     def apply_image_movement_button(self, action: MacroAction, stage: str) -> None:
         button_action = str(action.params.get("movement_button_action", "none"))
@@ -549,8 +575,41 @@ def find_image_match_for_action(action: MacroAction, *, stop_check: Callable[[],
     )
 
 
-def image_movement_points_for_match(action: MacroAction, match: object) -> list[tuple[int, int, float]]:
+def image_movement_points_for_match(
+    action: MacroAction,
+    match: object,
+    *,
+    start_position: tuple[int, int] | None = None,
+    bounds: object | None = None,
+    rng: object | None = None,
+) -> list[tuple[int, int, float]]:
     center_x, center_y = _match_center(match)
+    if bool(action.params.get("natural_movement", False)):
+        start_center = start_position or (center_x, center_y)
+        if str(action.params.get("movement_start_mode", "cursor")) == "screen":
+            start_center = _offset_pair(action.params.get("movement_start_center", [0, 0]))
+        start_dx, start_dy = random_circle_offset(
+            max(0, int(action.params.get("movement_start_radius", 0) or 0)),
+            rng,
+        )
+        click_offset = _offset_pair(action.params.get("click_offset", [0, 0]))
+        duration = max(0.0, float(action.params.get("movement_duration", 0.5) or 0.0))
+        points = humanized_path_points(
+            [
+                (start_center[0] + start_dx, start_center[1] + start_dy, 0.0),
+                (center_x + click_offset[0], center_y + click_offset[1], duration),
+            ],
+            hz=60,
+            endpoint_radius=max(0, int(action.params.get("click_radius", 0) or 0)),
+            path_variance=max(0.0, float(action.params.get("path_variance", 0.0) or 0.0)),
+            timing_variance_min=0.0,
+            timing_variance_max=0.0,
+            rng=rng,
+        )
+        if bounds is not None:
+            return [(*clamp_point(x, y, bounds), relative_time) for x, y, relative_time in points]
+        return points
+
     raw_path = action.params.get("movement_path") or []
     points: list[tuple[int, int, float]] = []
     for point in raw_path:

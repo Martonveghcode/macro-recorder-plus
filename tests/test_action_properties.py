@@ -74,10 +74,15 @@ def test_action_properties_emits_image_custom_movement_params(qtbot):
     widget.set_action(0, action)
 
     widget.param_widgets["click_action"].setCurrentIndex(widget.param_widgets["click_action"].findText("custom_movement"))
-    widget.param_widgets["movement_start_offset_x"].setValue(5)
-    widget.param_widgets["movement_start_offset_y"].setValue(-2)
-    widget.param_widgets["movement_end_offset_x"].setValue(25)
-    widget.param_widgets["movement_end_offset_y"].setValue(8)
+    widget.param_widgets["natural_movement"].setChecked(True)
+    widget.param_widgets["movement_start_mode"].setCurrentIndex(widget.param_widgets["movement_start_mode"].findData("screen"))
+    widget.param_widgets["movement_start_x"].setValue(500)
+    widget.param_widgets["movement_start_y"].setValue(300)
+    widget.param_widgets["movement_start_radius"].setValue(100)
+    widget.param_widgets["click_offset_x"].setValue(4)
+    widget.param_widgets["click_offset_y"].setValue(-2)
+    widget.param_widgets["click_radius"].setValue(5)
+    widget.param_widgets["path_variance"].setValue(9.0)
     widget.param_widgets["movement_duration"].setValue(0.75)
     widget.param_widgets["movement_button"].setCurrentIndex(widget.param_widgets["movement_button"].findText("right"))
     widget.param_widgets["movement_button_action"].setCurrentIndex(widget.param_widgets["movement_button_action"].findText("hold_during_move"))
@@ -88,11 +93,38 @@ def test_action_properties_emits_image_custom_movement_params(qtbot):
     row, updated = blocker.args
     assert row == 0
     assert updated.params["click_action"] == "custom_movement"
-    assert updated.params["movement_start_offset"] == [5, -2]
-    assert updated.params["movement_end_offset"] == [25, 8]
+    assert updated.params["natural_movement"] is True
+    assert updated.params["movement_start_mode"] == "screen"
+    assert updated.params["movement_start_center"] == [500, 300]
+    assert updated.params["movement_start_radius"] == 100
+    assert updated.params["click_offset"] == [4, -2]
+    assert updated.params["click_radius"] == 5
+    assert updated.params["path_variance"] == 9.0
     assert updated.params["movement_duration"] == 0.75
     assert updated.params["movement_button"] == "right"
     assert updated.params["movement_button_action"] == "hold_during_move"
+
+
+def test_start_circle_picker_updates_center_and_mode(qtbot):
+    widget = ActionProperties()
+    qtbot.addWidget(widget)
+    widget.set_action(0, create_action(ActionType.IMAGE_CLICK))
+
+    widget._set_start_circle_center(725, 410)
+
+    assert widget.param_widgets["movement_start_x"].value() == 725
+    assert widget.param_widgets["movement_start_y"].value() == 410
+    assert widget.param_widgets["movement_start_mode"].currentData() == "screen"
+
+
+def test_changing_an_action_to_image_enables_new_circle_movement(qtbot):
+    widget = ActionProperties()
+    qtbot.addWidget(widget)
+    widget.set_action(0, create_action(ActionType.COMMENT))
+
+    widget.type_combo.setCurrentIndex(widget.type_combo.findData(ActionType.IMAGE_CLICK.value))
+
+    assert widget.param_widgets["natural_movement"].isChecked()
 
 
 def test_action_properties_emits_if_image_result_params(qtbot):

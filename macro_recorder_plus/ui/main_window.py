@@ -5,21 +5,25 @@ import logging
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QSettings, Qt, QTimer, QUrl, Slot
-from PySide6.QtGui import QAction, QCloseEvent, QDesktopServices, QIcon, QKeySequence, QUndoStack
+from PySide6.QtCore import QSettings, Qt, QTimer, QUrl, Signal, Slot
+from PySide6.QtGui import QAction, QCloseEvent, QColor, QDesktopServices, QIcon, QKeySequence, QPalette, QResizeEvent, QUndoStack
 from PySide6.QtWidgets import (
     QFileDialog,
     QApplication,
     QDialog,
+    QDoubleSpinBox,
+    QFrame,
+    QGraphicsDropShadowEffect,
     QHBoxLayout,
     QLabel,
+    QComboBox,
     QMainWindow,
     QMenu,
     QMessageBox,
     QProgressBar,
     QProgressDialog,
     QPushButton,
-    QSplitter,
+    QScrollArea,
     QSpinBox,
     QStatusBar,
     QStyle,
@@ -35,7 +39,12 @@ from macro_recorder_plus.exporters.pyinstaller_exporter import PyInstallerExport
 from macro_recorder_plus.exporters.python_exporter import PythonExporter, default_export_directory, safe_script_filename
 from macro_recorder_plus.models.actions import ACTION_LABELS, ActionType, MacroAction, clamp_loop_count, create_action
 from macro_recorder_plus.models.environment import current_environment
-from macro_recorder_plus.models.macro import MAX_MACRO_LOOP_COUNT, MacroDocument, clamp_macro_loop_count
+from macro_recorder_plus.models.macro import (
+    MAX_MACRO_LOOP_COUNT,
+    MacroDocument,
+    clamp_macro_loop_count,
+    normalize_macro_loop_delay_settings,
+)
 from macro_recorder_plus.platform.windows_hotkeys import DEFAULT_HOTKEYS, HotkeyManager
 from macro_recorder_plus.playback.playback_engine import PlaybackEngine
 from macro_recorder_plus.recorder.input_recorder import InputRecorder, RecordingOptions
@@ -49,12 +58,20 @@ from macro_recorder_plus.ui.monitor_warning_dialog import MonitorWarningDialog
 from macro_recorder_plus.ui.recording_dialog import RecordingDialog
 from macro_recorder_plus.ui.settings_dialog import SettingsDialog
 from macro_recorder_plus.ui.state import AppState
-from macro_recorder_plus.ui.theme import apply_theme
+from macro_recorder_plus.ui.theme import apply_theme, load_appearance_settings
 from macro_recorder_plus.utilities.action_steps import LogicalActionStep, logical_action_steps, step_at_or_after, step_before
 from macro_recorder_plus.utilities.sound import play_notification
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+class OverlayWorkspace(QWidget):
+    resized = Signal()
+
+    def resizeEvent(self, event: QResizeEvent) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        self.resized.emit()
 
 
 class MainWindow(QMainWindow):
@@ -66,6 +83,8 @@ class MainWindow(QMainWindow):
         self.current_path: Path | None = None
         self.state = AppState.IDLE
         self.recording_hidden = False
+        self._recording_initial_action_count = 0
+        self._recording_updates_cursor_anchor = False
         self._step_cursor = 0
         self._step_mode = False
         self._step_active: LogicalActionStep | None = None
@@ -132,7 +151,7 @@ class MainWindow(QMainWindow):
 
     def _build_actions(self) -> None:
         style = self.style()
-        self.act_new = QAction(style.standardIcon(QStyle.SP_FileIcon), "Record New Macro", self)
+        self.act_new = QAction(style.standardIcon(QStyle.SP_FileIcon), "Record / Append Actions", self)
         self.act_new.setShortcut(QKeySequence.New)
         self.act_new.triggered.connect(self.record_new_macro)
 
@@ -286,7 +305,7 @@ class MainWindow(QMainWindow):
         central_layout = QVBoxLayout(central)
         controls = QHBoxLayout()
         self.record_button = QPushButton("Record")
-        self.record_button.setToolTip("Record new macro (F8)")
+        self.record_button.setToolTip("Record actions after the existing last action (F8)")
         self.record_button.clicked.connect(self.record_new_macro)
         self.run_button = QPushButton("Run")
         self.run_button.setToolTip("Run macro from the beginning")
@@ -303,6 +322,26 @@ class MainWindow(QMainWindow):
         self.macro_loop_spin.setToolTip("Run the whole macro this many times")
         self.macro_loop_spin.setSuffix(" times")
         self.macro_loop_spin.valueChanged.connect(self._macro_loop_count_changed)
+        self.loop_delay_mode = QComboBox()
+        self.loop_delay_mode.addItem("No pause", "none")
+        self.loop_delay_mode.addItem("Fixed pause", "fixed")
+        self.loop_delay_mode.addItem("Random range", "random")
+        self.loop_delay_mode.setToolTip("Choose whether playback pauses between whole-macro loops")
+        self.loop_delay_mode.currentIndexChanged.connect(self._macro_loop_timing_changed)
+        self.loop_delay_min = QDoubleSpinBox()
+        self.loop_delay_min.setRange(0.0, 86_400.0)
+        self.loop_delay_min.setDecimals(2)
+        self.loop_delay_min.setSingleStep(0.25)
+        self.loop_delay_min.setSuffix(" s")
+        self.loop_delay_min.setToolTip("Minimum wait after a loop finishes and before the next begins")
+        self.loop_delay_min.valueChanged.connect(self._macro_loop_timing_changed)
+        self.loop_delay_max = QDoubleSpinBox()
+        self.loop_delay_max.setRange(0.0, 86_400.0)
+        self.loop_delay_max.setDecimals(2)
+        self.loop_delay_max.setSingleStep(0.25)
+        self.loop_delay_max.setSuffix(" s")
+        self.loop_delay_max.setToolTip("Maximum wait after a loop finishes and before the next begins")
+        self.loop_delay_max.valueChanged.connect(self._macro_loop_timing_changed)
         self.pause_button = QPushButton("Pause")
         self.pause_button.setToolTip("Pause or resume recording/playback")
         self.pause_button.clicked.connect(self.pause_active)
@@ -324,8 +363,6 @@ class MainWindow(QMainWindow):
         controls.addWidget(self.run_button)
         controls.addWidget(self.step_back_button)
         controls.addWidget(self.step_forward_button)
-        controls.addWidget(QLabel("Macro loops"))
-        controls.addWidget(self.macro_loop_spin)
         controls.addWidget(self.pause_button)
         controls.addWidget(self.stop_button)
         controls.addSpacing(16)
@@ -335,9 +372,32 @@ class MainWindow(QMainWindow):
         controls.addWidget(QLabel("Progress"))
         controls.addWidget(self.progress)
         central_layout.addLayout(controls)
+        self.loop_timing_widget = QWidget()
+        loop_timing_layout = QHBoxLayout(self.loop_timing_widget)
+        loop_timing_layout.setContentsMargins(8, 0, 8, 0)
+        loop_timing_layout.addWidget(QLabel("Macro loops"))
+        loop_timing_layout.addWidget(self.macro_loop_spin)
+        loop_timing_layout.addSpacing(16)
+        loop_timing_layout.addWidget(QLabel("Between loops"))
+        loop_timing_layout.addWidget(self.loop_delay_mode)
+        loop_timing_layout.addSpacing(12)
+        self.loop_delay_lead_label = QLabel("Pause between loops")
+        self.loop_delay_to_label = QLabel("to")
+        self.loop_delay_help_label = QLabel("A new delay is chosen after each completed loop, except the final loop.")
+        self.loop_delay_help_label.setWordWrap(True)
+        loop_timing_layout.addWidget(self.loop_delay_lead_label)
+        loop_timing_layout.addWidget(self.loop_delay_min)
+        loop_timing_layout.addWidget(self.loop_delay_to_label)
+        loop_timing_layout.addWidget(self.loop_delay_max)
+        loop_timing_layout.addSpacing(8)
+        loop_timing_layout.addWidget(self.loop_delay_help_label, 1)
+        central_layout.addWidget(self.loop_timing_widget)
+        self._refresh_loop_timing_controls()
         central_layout.addWidget(self.countdown_banner)
 
-        splitter = QSplitter(Qt.Horizontal)
+        workspace = OverlayWorkspace()
+        workspace_layout = QVBoxLayout(workspace)
+        workspace_layout.setContentsMargins(0, 0, 0, 0)
         self.action_tabs = QTabWidget()
         self.table = self._create_action_table(self.model)
         self.pre_action_table = self._create_action_table(self.pre_action_model)
@@ -346,15 +406,49 @@ class MainWindow(QMainWindow):
         self.action_tabs.setTabToolTip(0, "These actions repeat according to Macro loops")
         self.action_tabs.setTabToolTip(1, "These actions run once whenever the macro is started, before the main loop")
         self.action_tabs.currentChanged.connect(self._action_tab_changed)
-        splitter.addWidget(self.action_tabs)
+        workspace_layout.addWidget(self.action_tabs)
 
         self.properties = ActionProperties()
-        self.properties.setMinimumWidth(320)
         self.properties.actionChanged.connect(self._replace_action_from_properties)
-        splitter.addWidget(self.properties)
-        splitter.setSizes([820, 360])
-        central_layout.addWidget(splitter)
-        self.splitter = splitter
+        properties_scroll = QScrollArea()
+        properties_scroll.setWidgetResizable(True)
+        properties_scroll.setFrameShape(QScrollArea.NoFrame)
+        properties_scroll.setWidget(self.properties)
+
+        self.properties_panel = QFrame(workspace)
+        self.properties_panel.setObjectName("floatingPropertiesPanel")
+        self.properties_panel.setAttribute(Qt.WA_StyledBackground, True)
+        panel_layout = QVBoxLayout(self.properties_panel)
+        panel_layout.setContentsMargins(10, 10, 10, 10)
+        panel_header = QHBoxLayout()
+        panel_title = QLabel("Action properties")
+        panel_title_font = panel_title.font()
+        panel_title_font.setBold(True)
+        panel_title.setFont(panel_title_font)
+        panel_close = QPushButton("Close")
+        panel_close.setToolTip("Collapse the floating action-properties panel")
+        panel_close.clicked.connect(lambda: self._set_properties_overlay_visible(False))
+        panel_header.addWidget(panel_title)
+        panel_header.addStretch(1)
+        panel_header.addWidget(panel_close)
+        panel_layout.addLayout(panel_header)
+        panel_layout.addWidget(properties_scroll, 1)
+        properties_scroll.viewport().setAutoFillBackground(False)
+        self.properties.setAutoFillBackground(False)
+
+        shadow = QGraphicsDropShadowEffect(self.properties_panel)
+        shadow.setBlurRadius(24)
+        shadow.setOffset(-4, 4)
+        shadow.setColor(QColor(0, 0, 0, 150))
+        self.properties_panel.setGraphicsEffect(shadow)
+        self.properties_panel.hide()
+        self._style_properties_panel()
+
+        self.workspace = workspace
+        self.properties_scroll = properties_scroll
+        workspace.resized.connect(self._position_properties_overlay)
+        central_layout.addWidget(workspace)
+        QTimer.singleShot(0, self._position_properties_overlay)
         self.setCentralWidget(central)
 
         self.status = QStatusBar(self)
@@ -379,6 +473,7 @@ class MainWindow(QMainWindow):
         table.setSortingEnabled(False)
         table.verticalHeader().setVisible(False)
         table.horizontalHeader().setStretchLastSection(True)
+        table.clicked.connect(lambda _index: self._set_properties_overlay_visible(True))
         table.doubleClicked.connect(lambda _index: self.properties.apply_button.setFocus())
         table.setContextMenuPolicy(Qt.CustomContextMenu)
         table.customContextMenuRequested.connect(self._show_context_menu)
@@ -411,6 +506,8 @@ class MainWindow(QMainWindow):
         active_model = self._active_model()
         action = active_model.actions[row] if 0 <= row < len(active_model.actions) else None
         self.properties.set_action(row, action)
+        if hasattr(self, "properties_panel"):
+            self._set_properties_overlay_visible(action is not None)
         if active_model is self.model and not self._updating_step_selection and self.state == AppState.IDLE and row >= 0:
             self._reset_step_session(row)
             self.model.set_playback_row(-1)
@@ -424,6 +521,56 @@ class MainWindow(QMainWindow):
         menu.addAction(self.act_move_up)
         menu.addAction(self.act_move_down)
         menu.exec(self._active_table().viewport().mapToGlobal(position))
+
+    def _set_properties_overlay_visible(self, visible: bool) -> None:
+        self.properties_panel.setVisible(bool(visible))
+        self._position_properties_overlay()
+
+    def _position_properties_overlay(self) -> None:
+        if not hasattr(self, "workspace"):
+            return
+        margin = 8
+        available_width = max(1, self.workspace.width())
+        available_height = max(1, self.workspace.height())
+        panel_width = min(500, max(400, available_width - 120))
+        panel_width = min(panel_width, max(1, available_width - (margin * 2)))
+        self.properties_panel.setGeometry(
+            max(margin, available_width - panel_width - margin),
+            margin,
+            panel_width,
+            max(1, available_height - (margin * 2)),
+        )
+        if self.properties_panel.isVisible():
+            self.properties_panel.raise_()
+
+    def _style_properties_panel(self) -> None:
+        appearance = load_appearance_settings(self.settings)
+        dark = appearance.theme_mode == "dark"
+        if appearance.theme_mode == "auto":
+            dark = self.palette().color(QPalette.Window).lightness() < 128
+        background = "#202124" if dark else "#FAFAFA"
+        foreground = "#F4F4F4" if dark else "#202124"
+        secondary = "#D0D0D0" if dark else "#4A4A4A"
+        self.properties_panel.setStyleSheet(
+            f"""
+            QFrame#floatingPropertiesPanel {{
+                background-color: {background};
+                border: 1px solid {appearance.primary_color};
+            }}
+            QFrame#floatingPropertiesPanel QLabel,
+            QFrame#floatingPropertiesPanel QCheckBox {{
+                color: {foreground};
+                background-color: transparent;
+            }}
+            QFrame#floatingPropertiesPanel QLabel#propertiesSecondaryText {{
+                color: {secondary};
+            }}
+            QFrame#floatingPropertiesPanel QScrollArea {{
+                background-color: transparent;
+                border: none;
+            }}
+            """
+        )
 
     def record_new_macro(self) -> None:
         options = RecordingOptions(
@@ -445,8 +592,6 @@ class MainWindow(QMainWindow):
             return
         if self.state in {AppState.RECORDING, AppState.RECORDING_PAUSED}:
             self.stop_recording()
-            return
-        if not self._maybe_save():
             return
         dialog = RecordingDialog(self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
@@ -473,13 +618,13 @@ class MainWindow(QMainWindow):
         if self.state in {AppState.RECORDING, AppState.RECORDING_PAUSED}:
             self.stop_recording()
             return
-        if not self._maybe_save():
-            return
-        self.document = MacroDocument(name="Recorded Macro", recorded_environment=current_environment())
-        self.current_path = None
-        self.model.replace_actions(self.document.actions)
-        self.pre_action_model.replace_actions(self.document.pre_actions)
-        self._load_document_settings()
+        self._recording_initial_action_count = len(self.model.actions)
+        self._recording_updates_cursor_anchor = self._recording_initial_action_count == 0
+        if self._recording_updates_cursor_anchor:
+            self.document.recorded_environment = current_environment()
+            if self.current_path is None and self.document.name == "Untitled Macro":
+                self.document.name = "Recorded Macro"
+        self.action_tabs.setCurrentIndex(0)
         self.undo_stack.clear()
         self.recording_hidden = hide_during_recording
         self.status.showMessage("Starting recording...")
@@ -534,7 +679,8 @@ class MainWindow(QMainWindow):
             from pynput import mouse
 
             x, y = mouse.Controller().position
-            self.document.recorded_environment.cursor_start = [int(x), int(y)]
+            if self._recording_updates_cursor_anchor:
+                self.document.recorded_environment.cursor_start = [int(x), int(y)]
         except Exception as exc:
             LOGGER.info("Could not capture initial cursor position: %s", exc)
         play_notification()
@@ -567,7 +713,8 @@ class MainWindow(QMainWindow):
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
         self._set_state(AppState.IDLE)
-        self.status.showMessage(f"Recording loaded with {len(self.model.actions)} action(s)")
+        appended = max(0, len(self.model.actions) - self._recording_initial_action_count)
+        self.status.showMessage(f"Appended {appended} recorded action(s); macro now has {len(self.model.actions)} action(s)")
 
     @Slot(object)
     def _append_recorded_action(self, action: MacroAction) -> None:
@@ -723,6 +870,7 @@ class MainWindow(QMainWindow):
         coordinate_mode = str(self.document.settings.get("coordinate_mode", self.settings.value("playback/coordinate_mode", "exact")))
         steps_per_loop = sum(clamp_loop_count(action.loop_count) for action in self.model.actions[row:] if action.enabled)
         pre_action_steps = sum(clamp_loop_count(action.loop_count) for action in self.pre_action_model.actions if action.enabled)
+        _delay_mode, loop_delay_minimum, loop_delay_maximum = normalize_macro_loop_delay_settings(self.document.settings)
         self.progress.setRange(0, max(1, pre_action_steps + steps_per_loop * self.macro_loop_spin.value()))
         self.progress.setValue(0)
         self.playback.play(
@@ -730,6 +878,8 @@ class MainWindow(QMainWindow):
             pre_actions=list(self.pre_action_model.actions),
             start_index=row,
             repeat_count=self.macro_loop_spin.value(),
+            loop_delay_min=loop_delay_minimum,
+            loop_delay_max=loop_delay_maximum,
             speed=speed,
             recorded_environment=self.document.recorded_environment,
             current_environment_snapshot=current_environment(),
@@ -980,6 +1130,7 @@ class MainWindow(QMainWindow):
             widget.style().unpolish(widget)
             widget.style().polish(widget)
             widget.update()
+        self._style_properties_panel()
 
     def _maybe_save(self) -> bool:
         if not self.model.dirty and not self.pre_action_model.dirty:
@@ -1003,15 +1154,75 @@ class MainWindow(QMainWindow):
         self.document.settings["playback_speed"] = float(self.settings.value("playback/speed", 1.0))
         self.document.settings["coordinate_mode"] = str(self.settings.value("playback/coordinate_mode", "exact"))
         self.document.settings["macro_loop_count"] = self.macro_loop_spin.value()
+        self._store_macro_loop_timing(mark_dirty=False)
 
     def _load_document_settings(self) -> None:
         self.macro_loop_spin.blockSignals(True)
+        self.loop_delay_mode.blockSignals(True)
+        self.loop_delay_min.blockSignals(True)
+        self.loop_delay_max.blockSignals(True)
         self.macro_loop_spin.setValue(clamp_macro_loop_count(self.document.settings.get("macro_loop_count", 1)))
+        delay_mode, delay_minimum, delay_maximum = normalize_macro_loop_delay_settings(self.document.settings)
+        mode_index = self.loop_delay_mode.findData(delay_mode)
+        self.loop_delay_mode.setCurrentIndex(mode_index if mode_index >= 0 else 0)
+        self.loop_delay_min.setValue(delay_minimum)
+        self.loop_delay_max.setValue(delay_maximum)
         self.macro_loop_spin.blockSignals(False)
+        self.loop_delay_mode.blockSignals(False)
+        self.loop_delay_min.blockSignals(False)
+        self.loop_delay_max.blockSignals(False)
+        self._refresh_loop_timing_controls()
 
     def _macro_loop_count_changed(self, value: int) -> None:
         self.document.settings["macro_loop_count"] = clamp_macro_loop_count(value)
         self.model.set_dirty(True)
+
+    def _macro_loop_timing_changed(self, *_args) -> None:
+        mode = str(self.loop_delay_mode.currentData() or "none")
+        if mode == "random" and self.loop_delay_min.value() > self.loop_delay_max.value():
+            if self.sender() is self.loop_delay_max:
+                self.loop_delay_min.blockSignals(True)
+                self.loop_delay_min.setValue(self.loop_delay_max.value())
+                self.loop_delay_min.blockSignals(False)
+            else:
+                self.loop_delay_max.blockSignals(True)
+                self.loop_delay_max.setValue(self.loop_delay_min.value())
+                self.loop_delay_max.blockSignals(False)
+        self._store_macro_loop_timing(mark_dirty=True)
+        self._refresh_loop_timing_controls()
+
+    def _store_macro_loop_timing(self, *, mark_dirty: bool) -> None:
+        mode = str(self.loop_delay_mode.currentData() or "none")
+        minimum = self.loop_delay_min.value()
+        maximum = self.loop_delay_max.value() if mode == "random" else minimum
+        normalized_mode, normalized_minimum, normalized_maximum = normalize_macro_loop_delay_settings(
+            {
+                "macro_loop_delay_mode": mode,
+                "macro_loop_delay_min": minimum,
+                "macro_loop_delay_max": maximum,
+            }
+        )
+        self.document.settings["macro_loop_delay_mode"] = normalized_mode
+        self.document.settings["macro_loop_delay_min"] = normalized_minimum
+        self.document.settings["macro_loop_delay_max"] = normalized_maximum
+        if mark_dirty:
+            self.model.set_dirty(True)
+
+    def _refresh_loop_timing_controls(self) -> None:
+        mode = str(self.loop_delay_mode.currentData() or "none")
+        has_delay = mode != "none"
+        random_range = mode == "random"
+        self.loop_delay_lead_label.setText("Random pause between loops" if random_range else "Fixed pause between loops")
+        self.loop_delay_lead_label.setVisible(has_delay)
+        self.loop_delay_min.setVisible(has_delay)
+        self.loop_delay_to_label.setVisible(has_delay and random_range)
+        self.loop_delay_max.setVisible(has_delay and random_range)
+        self.loop_delay_help_label.setVisible(has_delay)
+        self.loop_delay_help_label.setText(
+            "A new delay is chosen after each completed loop, except the final loop."
+            if random_range
+            else "Playback waits this long after each completed loop, except the final loop."
+        )
 
     def _on_dirty_changed(self, dirty: bool) -> None:
         self._update_title()
@@ -1051,6 +1262,9 @@ class MainWindow(QMainWindow):
         self.step_back_button.setEnabled(is_idle and has_enabled_actions)
         self.step_forward_button.setEnabled(is_idle and has_enabled_actions)
         self.macro_loop_spin.setEnabled(is_idle)
+        self.loop_delay_mode.setEnabled(is_idle)
+        self.loop_delay_min.setEnabled(is_idle)
+        self.loop_delay_max.setEnabled(is_idle)
         self.pause_button.setText("Resume" if self.state in {AppState.RECORDING_PAUSED, AppState.PLAYBACK_PAUSED} else "Pause")
         self.stop_button.setText("Cancel" if self.state == AppState.COUNTING_DOWN else "Stop")
         self.stop_button.setEnabled(True)
@@ -1082,13 +1296,10 @@ class MainWindow(QMainWindow):
         geometry = self.settings.value("window/geometry")
         if geometry:
             self.restoreGeometry(geometry)
-        splitter_state = self.settings.value("window/splitter")
-        if splitter_state:
-            self.splitter.restoreState(splitter_state)
+        self._set_properties_overlay_visible(False)
 
     def _save_window_state(self) -> None:
         self.settings.setValue("window/geometry", self.saveGeometry())
-        self.settings.setValue("window/splitter", self.splitter.saveState())
         self.settings.sync()
 
     def _show_error(self, message: str) -> None:

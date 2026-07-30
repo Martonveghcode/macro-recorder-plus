@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from macro_recorder_plus.models.actions import ActionType, MacroAction
+from macro_recorder_plus.models.actions import ActionType, MacroAction, create_action
 from macro_recorder_plus.models.macro import MacroDocument
 from macro_recorder_plus.storage.json_store import MacroFileError, load_macro, save_macro
 
@@ -37,6 +37,60 @@ def test_old_macro_defaults_to_one_whole_macro_loop():
     document = MacroDocument.from_dict({"format_version": 1, "name": "old", "settings": {"playback_speed": 1.0}})
 
     assert document.settings["macro_loop_count"] == 1
+    assert document.settings["macro_loop_delay_mode"] == "none"
+    assert document.settings["macro_loop_delay_min"] == 0.0
+    assert document.settings["macro_loop_delay_max"] == 0.0
+
+
+def test_random_macro_loop_delay_settings_round_trip(tmp_path):
+    document = MacroDocument(
+        name="paced",
+        settings={
+            "playback_speed": 1.0,
+            "coordinate_mode": "exact",
+            "macro_loop_count": 3,
+            "macro_loop_delay_mode": "random",
+            "macro_loop_delay_min": 1.0,
+            "macro_loop_delay_max": 2.0,
+        },
+    )
+
+    loaded = load_macro(save_macro(document, tmp_path / "paced.mrplus.json"))
+
+    assert loaded.settings["macro_loop_delay_mode"] == "random"
+    assert loaded.settings["macro_loop_delay_min"] == 1.0
+    assert loaded.settings["macro_loop_delay_max"] == 2.0
+
+
+def test_existing_mouse_move_is_not_upgraded_to_humanized_playback():
+    document = MacroDocument.from_dict(
+        {
+            "format_version": 1,
+            "name": "old mouse macro",
+            "actions": [
+                {
+                    "type": "mouse_move",
+                    "duration": 1.0,
+                    "params": {"start": [0, 0], "end": [100, 100], "path": []},
+                }
+            ],
+        }
+    )
+
+    assert "humanize_playback" not in document.actions[0].params
+
+
+def test_old_image_action_stays_exact_but_new_image_action_uses_circle_movement():
+    document = MacroDocument.from_dict(
+        {
+            "format_version": 1,
+            "name": "old image macro",
+            "actions": [{"type": "image_click", "params": {"image_path": "button.png"}}],
+        }
+    )
+
+    assert document.actions[0].params["natural_movement"] is False
+    assert create_action(ActionType.IMAGE_CLICK).params["natural_movement"] is True
 
 
 def test_invalid_macro_file_reports_error(tmp_path):

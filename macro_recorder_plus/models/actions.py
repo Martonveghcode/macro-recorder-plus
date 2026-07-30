@@ -95,6 +95,13 @@ DEFAULT_PARAMS: dict[ActionType, dict[str, Any]] = {
         "region_height": 0,
         "movement_start_offset": [0, 0],
         "movement_end_offset": [0, 0],
+        "natural_movement": False,
+        "movement_start_mode": "cursor",
+        "movement_start_center": [0, 0],
+        "movement_start_radius": 100,
+        "click_offset": [0, 0],
+        "click_radius": 5,
+        "path_variance": 8.0,
         "movement_duration": 0.5,
         "movement_button": "left",
         "movement_button_action": "none",
@@ -145,8 +152,15 @@ class MacroAction:
         self.timestamp = max(0.0, float(self.timestamp))
         self.duration = max(0.0, float(self.duration))
         self.loop_count = clamp_loop_count(self.loop_count)
+        provided_params = dict(self.params)
         defaults = dict(DEFAULT_PARAMS.get(self.type, {}))
-        defaults.update(self.params)
+        if self.type == ActionType.IMAGE_CLICK and "wait_until_found" not in provided_params:
+            try:
+                if float(provided_params.get("timeout", defaults.get("timeout", 5.0))) <= 0:
+                    defaults["wait_until_found"] = False
+            except (TypeError, ValueError):
+                pass
+        defaults.update(provided_params)
         self.params = defaults
 
     @property
@@ -262,10 +276,15 @@ class MacroAction:
 
 
 def create_action(action_type: ActionType, *, timestamp: float = 0.0, delay: float = 0.0) -> MacroAction:
+    params = dict(DEFAULT_PARAMS[action_type])
+    if action_type == ActionType.IMAGE_CLICK:
+        # Old files do not opt in when MacroAction fills defaults, while newly inserted
+        # image actions expose the safer, circle-based movement workflow immediately.
+        params["natural_movement"] = True
     return MacroAction(
         type=action_type,
         timestamp=timestamp,
         delay=delay,
         duration=float(DEFAULT_PARAMS.get(action_type, {}).get("seconds", 0.0)) if action_type == ActionType.WAIT else 0.0,
-        params=dict(DEFAULT_PARAMS[action_type]),
+        params=params,
     )

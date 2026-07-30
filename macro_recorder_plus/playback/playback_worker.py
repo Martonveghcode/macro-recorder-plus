@@ -1,13 +1,14 @@
 from __future__ import annotations
 
+import random
 import time
 
 from PySide6.QtCore import QObject, Signal, Slot
 
 from macro_recorder_plus.models.environment import RecordedEnvironment, current_environment
 from macro_recorder_plus.models.actions import ActionType, MacroAction, clamp_loop_count
-from macro_recorder_plus.models.macro import clamp_macro_loop_count
-from macro_recorder_plus.platform.windows_monitors import transform_point
+from macro_recorder_plus.models.macro import clamp_macro_loop_count, clamp_macro_loop_delay
+from macro_recorder_plus.platform.windows_monitors import clamp_point, transform_point
 from macro_recorder_plus.platform.windows_input import (
     ActionExecutor,
     find_image_match_for_action,
@@ -15,7 +16,7 @@ from macro_recorder_plus.platform.windows_input import (
     position_mouse,
 )
 from macro_recorder_plus.playback.safety_controller import SafetyController
-from macro_recorder_plus.utilities.mouse_path import interpolated_path_points
+from macro_recorder_plus.utilities.mouse_path import humanized_path_points, interpolated_path_points
 from macro_recorder_plus.utilities.timing import scaled_delay
 
 MOUSE_PLAYBACK_HZ = 60
@@ -37,6 +38,8 @@ class PlaybackWorker(QObject):
         start_index: int = 0,
         end_index: int | None = None,
         repeat_count: int = 1,
+        loop_delay_min: float = 0.0,
+        loop_delay_max: float = 0.0,
         speed: float = 1.0,
         respect_action_delays: bool = True,
         initial_image_found: bool | None = None,
@@ -53,6 +56,10 @@ class PlaybackWorker(QObject):
         self.limit_to_range = end_index is not None
         self.end_index = len(actions) if end_index is None else min(len(actions), max(self.start_index, end_index))
         self.repeat_count = clamp_macro_loop_count(repeat_count)
+        self.loop_delay_min = clamp_macro_loop_delay(loop_delay_min)
+        self.loop_delay_max = clamp_macro_loop_delay(loop_delay_max)
+        if self.loop_delay_min > self.loop_delay_max:
+            self.loop_delay_min, self.loop_delay_max = self.loop_delay_max, self.loop_delay_min
         self.speed = max(0.01, speed)
         self.respect_action_delays = respect_action_delays
         self.initial_image_found = initial_image_found
@@ -62,6 +69,8 @@ class PlaybackWorker(QObject):
         self.coordinate_mode = coordinate_mode
         self._paused = False
         self._last_image_found: bool | None = None
+        self._humanized_mouse_source: tuple[int, int] | None = None
+        self._humanized_mouse_destination: tuple[int, int] | None = None
 
     @Slot()
     def run(self) -> None:
@@ -110,6 +119,15 @@ class PlaybackWorker(QObject):
                 if not completed:
                     self.finished.emit(False, "Playback stopped")
                     return
+                if macro_loop_index + 1 < self.repeat_count:
+                    loop_delay = random.uniform(self.loop_delay_min, self.loop_delay_max)
+                    if loop_delay > 0:
+                        self.status.emit(
+                            f"Waiting {loop_delay:.2f}s before macro loop {macro_loop_index + 2} of {self.repeat_count}"
+                        )
+                        if not self._wait_seconds(loop_delay, mouse_controller):
+                            self.finished.emit(False, "Playback stopped")
+                            return
             self.playbackContext.emit(index, self._last_image_found)
             message = "Playback complete"
             if self.repeat_count > 1:
@@ -125,6 +143,7 @@ class PlaybackWorker(QObject):
     def _begin_macro_loop(self, executor: ActionExecutor, mouse_controller: object) -> bool:
         """Reset transient input state and reproduce the same cursor anchor for every loop."""
         executor.release_all()
+        self._clear_humanized_mouse_destination()
         if self._wait_while_paused_or_stopped(mouse_controller):
             return True
         if self.recorded_environment.cursor_start:
@@ -160,6 +179,8 @@ class PlaybackWorker(QObject):
             if not action.enabled:
                 if action.type == ActionType.IMAGE_CLICK:
                     self._last_image_found = None
+                if action.type == ActionType.MOUSE_MOVE:
+                    self._clear_humanized_mouse_destination()
                 index = next_index
                 continue
             for _loop_index in range(clamp_loop_count(action.loop_count)):
@@ -170,6 +191,8 @@ class PlaybackWorker(QObject):
                     return False, index
                 try:
                     transformed_action = self._with_transformed_coordinates(action)
+                    if action.type in {ActionType.MOUSE_BUTTON, ActionType.SCROLL}:
+                        transformed_action = self._with_humanized_mouse_destination(transformed_action)
                     if action.type == ActionType.WAIT:
                         wait_seconds = float(action.params.get("seconds", action.duration or action.delay))
                         if not self._wait_seconds(scaled_delay(wait_seconds, self.speed), mouse_controller):
@@ -178,6 +201,7 @@ class PlaybackWorker(QObject):
                         if not self._play_mouse_move(transformed_action, mouse_controller):
                             return False, index
                     elif action.type == ActionType.IMAGE_CLICK:
+                        self._clear_humanized_mouse_destination()
                         image_found = self._play_image_click(transformed_action, executor, mouse_controller)
                         if image_found is None:
                             return False, index
@@ -230,15 +254,51 @@ class PlaybackWorker(QObject):
             time.sleep(min(remaining, 0.005))
 
     def _play_mouse_move(self, action: MacroAction, mouse_controller: object) -> bool:
-        points = _mouse_move_points(action)
+        source_points = _mouse_move_points(action)
+        if not source_points:
+            self._clear_humanized_mouse_destination()
+            return True
+        start_override = None
+        if (
+            self._humanized_mouse_source == (source_points[0][0], source_points[0][1])
+            and self._humanized_mouse_destination is not None
+        ):
+            start_override = self._humanized_mouse_destination
+        self._clear_humanized_mouse_destination()
+        points = _playback_mouse_points(
+            action,
+            self.current_environment.virtual_desktop,
+            start_override=start_override,
+        )
         if not points:
             return True
         start_time = time.perf_counter()
-        for x, y, relative_time in _interpolated_mouse_points(points):
+        for x, y, relative_time in points:
             if not self._wait_until(start_time + (relative_time / self.speed), mouse_controller):
                 return False
             position_mouse(mouse_controller, int(x), int(y))
+        if bool(action.params.get("humanize_playback", False)):
+            self._humanized_mouse_source = (source_points[-1][0], source_points[-1][1])
+            self._humanized_mouse_destination = (points[-1][0], points[-1][1])
         return True
+
+    def _with_humanized_mouse_destination(self, action: MacroAction) -> MacroAction:
+        params = action.params
+        target = (params.get("x"), params.get("y"))
+        if (
+            self._humanized_mouse_source is not None
+            and self._humanized_mouse_destination is not None
+            and target == self._humanized_mouse_source
+        ):
+            varied_params = dict(params)
+            varied_params["x"], varied_params["y"] = self._humanized_mouse_destination
+            return action.with_changes(params=varied_params)
+        self._clear_humanized_mouse_destination()
+        return action
+
+    def _clear_humanized_mouse_destination(self) -> None:
+        self._humanized_mouse_source = None
+        self._humanized_mouse_destination = None
 
     def _play_image_click(self, action: MacroAction, executor: ActionExecutor, mouse_controller: object) -> bool | None:
         def stop_check() -> bool:
@@ -253,8 +313,15 @@ class PlaybackWorker(QObject):
             if str(action.params.get("on_not_found", "error")) == "skip":
                 return False
             raise ValueError(f"Image not found on screen: {action.params.get('image_path', '')}")
-        if str(action.params.get("click_action", "left_click")) == "custom_movement":
-            return self._play_image_custom_movement(action, match, executor, mouse_controller)
+        click_action = str(action.params.get("click_action", "left_click"))
+        natural_movement = bool(action.params.get("natural_movement", False))
+        if natural_movement or click_action == "custom_movement":
+            result = self._play_image_custom_movement(action, match, executor, mouse_controller)
+            if result is not True:
+                return result
+            if natural_movement and click_action not in {"move_only", "custom_movement"}:
+                executor.apply_image_click_at_current_position(action)
+            return True
         executor.click_image_match(action, match)
         return True
 
@@ -265,7 +332,16 @@ class PlaybackWorker(QObject):
         executor: ActionExecutor,
         mouse_controller: object,
     ) -> bool | None:
-        points = image_movement_points_for_match(action, match)
+        current_position = getattr(mouse_controller, "position", None)
+        start_position = None
+        if current_position is not None:
+            start_position = (int(current_position[0]), int(current_position[1]))
+        points = image_movement_points_for_match(
+            action,
+            match,
+            start_position=start_position,
+            bounds=self.current_environment.virtual_desktop,
+        )
         if not points:
             return True
         interpolated_points = _interpolated_mouse_points(points)
@@ -273,13 +349,16 @@ class PlaybackWorker(QObject):
             return True
         first_x, first_y, _ = interpolated_points[0]
         position_mouse(mouse_controller, int(first_x), int(first_y))
-        executor.apply_image_movement_button(action, "start")
+        apply_movement_button = str(action.params.get("click_action", "left_click")) == "custom_movement"
+        if apply_movement_button:
+            executor.apply_image_movement_button(action, "start")
         start_time = time.perf_counter()
         for x, y, relative_time in interpolated_points[1:]:
             if not self._wait_until(start_time + (relative_time / self.speed), mouse_controller):
                 return None
             position_mouse(mouse_controller, int(x), int(y))
-        executor.apply_image_movement_button(action, "end")
+        if apply_movement_button:
+            executor.apply_image_movement_button(action, "end")
         return True
 
     def _conditional_jump_index(self, action: MacroAction, action_count: int | None = None) -> int | None:
@@ -312,7 +391,7 @@ class PlaybackWorker(QObject):
             time.sleep(min(remaining, 0.005))
 
     def _with_transformed_coordinates(self, action: MacroAction) -> MacroAction:
-        if action.type not in {ActionType.MOUSE_MOVE, ActionType.MOUSE_BUTTON, ActionType.SCROLL}:
+        if action.type not in {ActionType.MOUSE_MOVE, ActionType.MOUSE_BUTTON, ActionType.SCROLL, ActionType.IMAGE_CLICK}:
             return action
         params = dict(action.params)
         if action.type == ActionType.MOUSE_MOVE:
@@ -328,7 +407,7 @@ class PlaybackWorker(QObject):
                     ]
                     for point in params["path"]
                 ]
-        else:
+        elif action.type in {ActionType.MOUSE_BUTTON, ActionType.SCROLL}:
             if "x" in params and "y" in params:
                 params["x"], params["y"] = transform_point(
                     int(params["x"]),
@@ -336,6 +415,18 @@ class PlaybackWorker(QObject):
                     self.recorded_environment,
                     self.current_environment,
                     mode=self.coordinate_mode,
+                )
+        elif bool(params.get("natural_movement", False)) and str(params.get("movement_start_mode", "cursor")) == "screen":
+            start_center = params.get("movement_start_center")
+            if isinstance(start_center, (list, tuple)) and len(start_center) >= 2:
+                params["movement_start_center"] = list(
+                    transform_point(
+                        int(start_center[0]),
+                        int(start_center[1]),
+                        self.recorded_environment,
+                        self.current_environment,
+                        mode=self.coordinate_mode,
+                    )
                 )
         return action.with_changes(params=params)
 
@@ -363,3 +454,21 @@ def _mouse_move_points(action: MacroAction) -> list[tuple[int, int, float]]:
 
 def _interpolated_mouse_points(points: list[tuple[int, int, float]]) -> list[tuple[int, int, float]]:
     return interpolated_path_points(points, hz=MOUSE_PLAYBACK_HZ)
+
+
+def _playback_mouse_points(
+    action: MacroAction,
+    bounds: object,
+    *,
+    rng: object | None = None,
+    start_override: tuple[int, int] | None = None,
+) -> list[tuple[int, int, float]]:
+    points = _mouse_move_points(action)
+    if not bool(action.params.get("humanize_playback", False)):
+        return _interpolated_mouse_points(points)
+    if points and start_override is not None:
+        points[0] = (int(start_override[0]), int(start_override[1]), points[0][2])
+    return [
+        (*clamp_point(x, y, bounds), relative_time)
+        for x, y, relative_time in humanized_path_points(points, hz=MOUSE_PLAYBACK_HZ, rng=rng)
+    ]

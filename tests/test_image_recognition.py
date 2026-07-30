@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import math
+import random
 import sys
 from types import ModuleType, SimpleNamespace
 
 from PIL import Image, ImageDraw
 
 from macro_recorder_plus.models.actions import ActionType, MacroAction
+from macro_recorder_plus.models.environment import Rect
 from macro_recorder_plus.platform import windows_input
 from macro_recorder_plus.platform.windows_input import ActionExecutor
-from macro_recorder_plus.utilities.image_recognition import locate_image_in_image
+from macro_recorder_plus.utilities.image_recognition import _grab_screen, locate_image_in_image
 
 
 def test_locates_template_center_with_confidence():
@@ -144,3 +147,77 @@ def test_custom_image_movement_uses_offsets_and_button_hold(monkeypatch):
 
     assert mouse.position == (110, 205)
     assert mouse.calls == [("press", "left", (105, 198)), ("release", "left", (110, 205))]
+
+
+def test_natural_image_movement_uses_configured_start_and_click_circles():
+    action = MacroAction(
+        type=ActionType.IMAGE_CLICK,
+        params={
+            "natural_movement": True,
+            "movement_start_mode": "screen",
+            "movement_start_center": [400, 300],
+            "movement_start_radius": 100,
+            "click_offset": [3, -2],
+            "click_radius": 5,
+            "path_variance": 10.0,
+            "movement_duration": 0.75,
+        },
+    )
+
+    points = windows_input.image_movement_points_for_match(
+        action,
+        SimpleNamespace(center=(800, 500)),
+        start_position=(10, 10),
+        bounds=Rect(0, 0, 1920, 1080),
+        rng=random.Random(7),
+    )
+
+    assert math.hypot(points[0][0] - 400, points[0][1] - 300) <= 100
+    assert math.hypot(points[-1][0] - 803, points[-1][1] - 498) <= 5
+    assert points[-1][2] == 0.75
+    assert any(point[1] != points[0][1] for point in points[1:-1])
+
+
+def test_region_capture_requests_all_screens_for_negative_monitor_coordinates():
+    calls = []
+
+    class FakeGrabber:
+        @staticmethod
+        def grab(**kwargs):
+            calls.append(kwargs)
+            return "shot"
+
+    screenshot, offset_x, offset_y = _grab_screen(FakeGrabber, (-1920, 50, 800, 600))
+
+    assert screenshot == "shot"
+    assert (offset_x, offset_y) == (-1920, 50)
+    assert calls == [{"bbox": (-1920, 50, -1120, 650), "all_screens": True}]
+
+
+def test_selected_region_match_returns_absolute_screen_coordinates(tmp_path, monkeypatch):
+    screen_region = Image.new("RGB", (120, 90), "white")
+    target = Image.new("RGB", (18, 14), "navy")
+    ImageDraw.Draw(target).line((2, 7, 15, 7), fill="white", width=2)
+    screen_region.paste(target, (42, 31))
+    target_path = tmp_path / "target.png"
+    target.save(target_path)
+    calls = []
+
+    def fake_grab(**kwargs):
+        calls.append(kwargs)
+        return screen_region
+
+    monkeypatch.setattr("PIL.ImageGrab.grab", fake_grab)
+    match = windows_input.find_image_on_screen(
+        target_path,
+        confidence=0.99,
+        wait_until_found=False,
+        grayscale=False,
+        region=(-1600, 200, 120, 90),
+        verification_attempts=1,
+        scale_tolerance=0.0,
+    )
+
+    assert match is not None
+    assert (match.x, match.y) == (-1558, 231)
+    assert calls == [{"bbox": (-1600, 200, -1480, 290), "all_screens": True}]

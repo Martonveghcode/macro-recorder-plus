@@ -10,6 +10,8 @@ from .environment import RecordedEnvironment
 
 FORMAT_VERSION = 1
 MAX_MACRO_LOOP_COUNT = 99999
+MAX_MACRO_LOOP_DELAY_SECONDS = 86_400.0
+MACRO_LOOP_DELAY_MODES = {"none", "fixed", "random"}
 
 
 def clamp_macro_loop_count(value: Any) -> int:
@@ -20,8 +22,38 @@ def clamp_macro_loop_count(value: Any) -> int:
     return min(MAX_MACRO_LOOP_COUNT, max(1, count))
 
 
+def clamp_macro_loop_delay(value: Any) -> float:
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        seconds = 0.0
+    return min(MAX_MACRO_LOOP_DELAY_SECONDS, max(0.0, seconds))
+
+
+def normalize_macro_loop_delay_settings(settings: dict[str, Any]) -> tuple[str, float, float]:
+    mode = str(settings.get("macro_loop_delay_mode", "none")).lower()
+    if mode not in MACRO_LOOP_DELAY_MODES:
+        mode = "none"
+    minimum = clamp_macro_loop_delay(settings.get("macro_loop_delay_min", 0.0))
+    maximum = clamp_macro_loop_delay(settings.get("macro_loop_delay_max", minimum))
+    if minimum > maximum:
+        minimum, maximum = maximum, minimum
+    if mode == "none":
+        minimum = maximum = 0.0
+    elif mode == "fixed":
+        maximum = minimum
+    return mode, minimum, maximum
+
+
 def default_macro_settings() -> dict[str, Any]:
-    return {"playback_speed": 1.0, "coordinate_mode": "exact", "macro_loop_count": 1}
+    return {
+        "playback_speed": 1.0,
+        "coordinate_mode": "exact",
+        "macro_loop_count": 1,
+        "macro_loop_delay_mode": "none",
+        "macro_loop_delay_min": 0.0,
+        "macro_loop_delay_max": 0.0,
+    }
 
 
 def utc_now() -> str:
@@ -81,6 +113,10 @@ class MacroDocument:
         settings.setdefault("playback_speed", 1.0)
         settings.setdefault("coordinate_mode", "exact")
         settings["macro_loop_count"] = clamp_macro_loop_count(settings.get("macro_loop_count", 1))
+        delay_mode, delay_minimum, delay_maximum = normalize_macro_loop_delay_settings(settings)
+        settings["macro_loop_delay_mode"] = delay_mode
+        settings["macro_loop_delay_min"] = delay_minimum
+        settings["macro_loop_delay_max"] = delay_maximum
         return cls(
             format_version=version,
             name=str(data.get("name") or "Untitled Macro"),

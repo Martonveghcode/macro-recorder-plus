@@ -38,6 +38,7 @@ class EventNormalizer:
     def flush_mouse_move(self) -> list[MacroAction]:
         if len(self._move_points) < 2:
             self._move_points.clear()
+            self._last_move_sample_time = -1.0
             return []
         points = simplify_path(self._move_points, self.options.simplification_tolerance)
         start = points[0]
@@ -52,9 +53,11 @@ class EventNormalizer:
                 "end": [end[0], end[1]],
                 "path": path_to_json(points),
                 "coordinate_mode": "exact",
+                "humanize_playback": True,
             },
         )
         self._move_points.clear()
+        self._last_move_sample_time = -1.0
         return [action]
 
     def add_keyboard(self, key: str, phase: str, now: float) -> list[MacroAction]:
@@ -76,15 +79,22 @@ class EventNormalizer:
         ]
 
     def add_mouse_button(self, x: int, y: int, button: str, phase: str, now: float) -> list[MacroAction]:
-        return self.flush_mouse_move() + [
+        timestamp = now - self._start_time
+        self._append_mouse_destination(x, y, timestamp)
+        actions = self.flush_mouse_move() + [
             self._make_action(
                 ActionType.MOUSE_BUTTON,
-                timestamp=now - self._start_time,
+                timestamp=timestamp,
                 params={"x": int(x), "y": int(y), "button": button, "phase": phase},
             )
         ]
+        if phase == "press":
+            self._move_points = [(int(x), int(y), timestamp)]
+            self._last_move_sample_time = timestamp
+        return actions
 
     def add_scroll(self, x: int, y: int, dx: int, dy: int, now: float) -> list[MacroAction]:
+        self._append_mouse_destination(x, y, now - self._start_time)
         return self.flush_mouse_move() + [
             self._make_action(
                 ActionType.SCROLL,
@@ -104,3 +114,11 @@ class EventNormalizer:
         delay = max(0.0, timestamp - self._last_action_time)
         self._last_action_time = max(self._last_action_time, timestamp + duration)
         return MacroAction(type=action_type, timestamp=timestamp, delay=delay, duration=duration, params=params)
+
+    def _append_mouse_destination(self, x: int, y: int, timestamp: float) -> None:
+        if not self._move_points:
+            return
+        destination = (int(x), int(y))
+        last = self._move_points[-1]
+        if destination != (last[0], last[1]):
+            self._move_points.append((*destination, float(timestamp)))

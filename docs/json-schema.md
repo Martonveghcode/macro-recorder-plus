@@ -17,6 +17,9 @@ Macro files are UTF-8 JSON documents. The default extension is `.mrplus.json`.
   "settings": {
     "playback_speed": 1.0,
     "macro_loop_count": 1,
+    "macro_loop_delay_mode": "random",
+    "macro_loop_delay_min": 1.0,
+    "macro_loop_delay_max": 2.0,
     "coordinate_mode": "exact"
   },
   "pre_actions": [],
@@ -25,6 +28,8 @@ Macro files are UTF-8 JSON documents. The default extension is `.mrplus.json`.
 ```
 
 `settings.macro_loop_count` repeats the complete macro during GUI playback and in exported runners. It defaults to `1` and is clamped to `1` through `99999`.
+
+`settings.macro_loop_delay_mode` is `none`, `fixed`, or `random`. `macro_loop_delay_min` and `macro_loop_delay_max` are seconds, clamped to `0` through `86400`. A fresh random duration is selected between completed whole-macro loops; no delay is added after the final loop. Missing fields in older macros default to `none` and do not change their playback.
 
 `pre_actions` uses the same action objects as `actions`, but runs once at the start of playback before the main action loop. Missing `pre_actions` in older files defaults to an empty list.
 
@@ -39,6 +44,46 @@ Each action contains:
 - `loop_count`: how many times playback repeats this action before advancing. Values are clamped to `1` through `99999`.
 - `label`: optional human-readable label.
 - `params`: action-specific parameters.
+
+Newly recorded mouse movements opt into varied playback on each run:
+
+```json
+{
+  "type": "mouse_move",
+  "duration": 0.75,
+  "params": {
+    "start": [100, 100],
+    "end": [500, 300],
+    "path": [[100, 100, 0.0], [500, 300, 0.75]],
+    "coordinate_mode": "exact",
+    "humanize_playback": true
+  }
+}
+```
+
+`humanize_playback` adds a smooth variation of up to 2 pixels around the recorded path, selects an endpoint within a 5-pixel-radius circle, and makes the movement 0.1 to 0.2 seconds faster or slower. A following click, release, or scroll at the recorded endpoint uses the same varied destination. The field is absent from older macros, which preserves their exact playback behavior.
+
+New image-click actions can use circle-based natural movement:
+
+```json
+{
+  "type": "image_click",
+  "params": {
+    "image_path": "button.png",
+    "click_action": "left_click",
+    "natural_movement": true,
+    "movement_start_mode": "screen",
+    "movement_start_center": [800, 500],
+    "movement_start_radius": 100,
+    "click_offset": [0, 0],
+    "click_radius": 5,
+    "path_variance": 8.0,
+    "movement_duration": 0.75
+  }
+}
+```
+
+`movement_start_mode` is `cursor` or `screen`. The start point is chosen inside `movement_start_radius` around the current cursor or `movement_start_center`. The final point is chosen inside `click_radius` around the matched image center plus `click_offset`. `path_variance` adds a smooth curved deviation rather than per-pixel jitter. Imported actions without `natural_movement` retain their previous exact or legacy custom-offset behavior.
 
 Secret input actions store only an environment variable name:
 

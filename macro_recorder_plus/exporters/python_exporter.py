@@ -65,12 +65,20 @@ def safe_batch_filename(script_path: Path) -> str:
     return f"run_{stem}.bat"
 
 
+def export_support_directory(target: str | Path) -> Path:
+    """Keep auxiliary export files out of the visible Desktop when possible."""
+    target = Path(target)
+    if target.parent.name.casefold() == "desktop":
+        return target.parent / "misc"
+    return target.parent
+
+
 class PythonExporter:
     def __init__(self, *, python_executable: str | Path | None = None) -> None:
         configured = str(python_executable).strip() if python_executable else ""
         self.python_executable = configured or str(Path(sys.executable))
 
-    def render(self, document: MacroDocument) -> str:
+    def render(self, document: MacroDocument, *, runtime_relative_path: str | Path = RUNTIME_DIR_NAME) -> str:
         payload = json.dumps(document.to_dict(), separators=(",", ":"), sort_keys=True)
         template = '''\
 #!/usr/bin/env python3
@@ -79,41 +87,65 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import importlib.util
 import json
 import math
 import os
+import random
 import subprocess
 import sys
 import threading
 import time
+import traceback
 import webbrowser
 from getpass import getpass
 from pathlib import Path
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-RUNTIME_DIR = SCRIPT_DIR / "__RUNTIME_DIR_NAME__"
+RUNTIME_DIR = SCRIPT_DIR / Path(__RUNTIME_RELATIVE_PATH__)
 LOCAL_DEPS = RUNTIME_DIR / "__DEPENDENCIES_DIR_NAME__"
 if LOCAL_DEPS.exists():
     sys.path.insert(0, str(LOCAL_DEPS))
 
 REQUIRED_PACKAGES = __REQUIRED_PACKAGES__
+REQUIRED_IMPORTS = ("pynput", "PIL", "numpy")
 MACRO = json.loads(__MACRO_JSON__)
+
+
+def is_dedicated_console_launch():
+    """Treat a no-argument Windows run as a double-click launch."""
+    return sys.platform == "win32" and len(sys.argv) == 1
+
+
+def hide_console_window():
+    if sys.platform != "win32":
+        return
+    hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+    if hwnd:
+        ctypes.windll.user32.ShowWindow(hwnd, 0)  # SW_HIDE
 
 
 def set_dpi_awareness():
     if sys.platform != "win32":
         return
+    user32 = ctypes.windll.user32
     try:
-        ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
+        user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
     except Exception:
         try:
             ctypes.windll.shcore.SetProcessDpiAwareness(2)
         except Exception:
             try:
-                ctypes.windll.user32.SetProcessDPIAware()
+                user32.SetProcessDPIAware()
             except Exception:
                 pass
+    try:
+        user32.SetThreadDpiAwarenessContext.argtypes = [ctypes.c_void_p]
+        user32.SetThreadDpiAwarenessContext.restype = ctypes.c_void_p
+        user32.SetThreadDpiAwarenessContext(ctypes.c_void_p(-4))
+    except Exception:
+        pass
 
 
 def current_virtual_desktop():
@@ -165,7 +197,7 @@ def transform_point(x, y, recorded_environment, current_bounds, mode="exact"):
 
 def transform_action_coordinates(action, recorded_environment, current_bounds, coordinate_mode):
     action_type = action.get("type")
-    if action_type not in {"mouse_move", "mouse_button", "scroll"}:
+    if action_type not in {"mouse_move", "mouse_button", "scroll", "image_click"}:
         return action
     transformed = dict(action)
     params = dict(action.get("params", {}))
@@ -185,10 +217,20 @@ def transform_action_coordinates(action, recorded_environment, current_bounds, c
                 for point in params["path"]
                 if len(point) >= 3
             ]
-    elif "x" in params and "y" in params:
+    elif action_type in {"mouse_button", "scroll"} and "x" in params and "y" in params:
         params["x"], params["y"] = transform_point(
             params["x"], params["y"], recorded_environment, current_bounds, coordinate_mode
         )
+    elif (
+        action_type == "image_click"
+        and params.get("natural_movement", False)
+        and str(params.get("movement_start_mode", "cursor")) == "screen"
+    ):
+        start_center = params.get("movement_start_center")
+        if isinstance(start_center, (list, tuple)) and len(start_center) >= 2:
+            params["movement_start_center"] = list(
+                transform_point(start_center[0], start_center[1], recorded_environment, current_bounds, coordinate_mode)
+            )
     transformed["params"] = params
     return transformed
 
@@ -231,13 +273,26 @@ def install_dependencies():
     return subprocess.call(command)
 
 
+def ensure_dependencies():
+    missing = [name for name in REQUIRED_IMPORTS if importlib.util.find_spec(name) is None]
+    if not missing:
+        return True
+    print(f"Missing export dependencies: {', '.join(missing)}")
+    if install_dependencies() != 0:
+        return False
+    if str(LOCAL_DEPS) not in sys.path:
+        sys.path.insert(0, str(LOCAL_DEPS))
+    importlib.invalidate_caches()
+    return all(importlib.util.find_spec(name) is not None for name in REQUIRED_IMPORTS)
+
+
 def import_input_modules():
     try:
         from pynput import keyboard, mouse
         return keyboard, mouse
     except Exception as exc:
         print(f"pynput is required: {exc}", file=sys.stderr)
-        print("Run the generated run_*.bat file, or run this script with --install-deps first.", file=sys.stderr)
+        print("Run this script with --install-deps first.", file=sys.stderr)
         return None, None
 
 
@@ -662,7 +717,10 @@ def find_image_on_screen(params, stop_event=None):
 def grab_screen(image_grab_module, region):
     if region is not None:
         x, y, width, height = region
-        screenshot = image_grab_module.grab(bbox=(x, y, x + width, y + height))
+        try:
+            screenshot = image_grab_module.grab(bbox=(x, y, x + width, y + height), all_screens=True)
+        except TypeError:
+            screenshot = image_grab_module.grab(bbox=(x, y, x + width, y + height))
         return screenshot, int(x), int(y)
     try:
         screenshot = image_grab_module.grab(all_screens=True)
@@ -773,29 +831,70 @@ def execute_image_click(params, mouse_controller, mouse, stop_event=None, held_b
             return False
         raise RuntimeError(f"Image not found on screen: {params.get('image_path', '')}")
 
-    position_mouse(mouse_controller, *match["center"])
     click_action = str(params.get("click_action", "left_click"))
+    if bool(params.get("natural_movement", False)):
+        execute_image_movement(
+            params,
+            match,
+            mouse_controller,
+            mouse,
+            stop_event=stop_event,
+            held_buttons=held_buttons,
+            speed=speed,
+            apply_movement_button=click_action == "custom_movement",
+        )
+        if stop_event is not None and stop_event.is_set():
+            return None
+        if click_action in {"move_only", "custom_movement"}:
+            return True
+        apply_image_click_at_current_position(params, mouse_controller, mouse)
+        return True
+
+    position_mouse(mouse_controller, *match["center"])
     if click_action == "move_only":
         return True
     if click_action == "custom_movement":
         execute_image_movement(params, match, mouse_controller, mouse, stop_event=stop_event, held_buttons=held_buttons, speed=speed)
         return None if stop_event is not None and stop_event.is_set() else True
+    apply_image_click_at_current_position(params, mouse_controller, mouse)
+    return True
+
+
+def apply_image_click_at_current_position(params, mouse_controller, mouse):
+    click_action = str(params.get("click_action", "left_click"))
+    if click_action in {"move_only", "custom_movement"}:
+        return
     if click_action == "double_click":
         button = button_from_name("left", mouse)
         for _ in range(2):
             mouse_controller.press(button)
             mouse_controller.release(button)
             time.sleep(0.05)
-        return True
+        return
 
     button = button_from_name(click_action.replace("_click", ""), mouse)
     mouse_controller.press(button)
     mouse_controller.release(button)
-    return True
+    return
 
 
-def execute_image_movement(params, match, mouse_controller, mouse, stop_event=None, held_buttons=None, speed=1.0):
-    points = image_movement_points(params, match)
+def execute_image_movement(
+    params,
+    match,
+    mouse_controller,
+    mouse,
+    stop_event=None,
+    held_buttons=None,
+    speed=1.0,
+    apply_movement_button=True,
+):
+    current_position = getattr(mouse_controller, "position", match["center"])
+    points = image_movement_points(
+        params,
+        match,
+        start_position=(int(current_position[0]), int(current_position[1])),
+        current_bounds=current_virtual_desktop(),
+    )
     if not points:
         return
     interpolated_points = interpolated_mouse_points(points)
@@ -803,7 +902,8 @@ def execute_image_movement(params, match, mouse_controller, mouse, stop_event=No
         return
     first_x, first_y, _ = interpolated_points[0]
     position_mouse(mouse_controller, first_x, first_y)
-    apply_image_movement_button(params, mouse_controller, mouse, "start", held_buttons)
+    if apply_movement_button:
+        apply_image_movement_button(params, mouse_controller, mouse, "start", held_buttons)
     start_time = time.perf_counter()
     for x, y, relative_time in interpolated_points[1:]:
         target = start_time + (relative_time / max(0.01, speed))
@@ -815,11 +915,38 @@ def execute_image_movement(params, match, mouse_controller, mouse, stop_event=No
             if remaining > 0:
                 time.sleep(remaining)
         position_mouse(mouse_controller, x, y)
-    apply_image_movement_button(params, mouse_controller, mouse, "end", held_buttons)
+    if apply_movement_button:
+        apply_image_movement_button(params, mouse_controller, mouse, "end", held_buttons)
 
 
-def image_movement_points(params, match):
+def image_movement_points(params, match, start_position=None, current_bounds=None, rng=None):
     center_x, center_y = match["center"]
+    if bool(params.get("natural_movement", False)):
+        random_source = rng or random
+        start_center = start_position or (center_x, center_y)
+        if str(params.get("movement_start_mode", "cursor")) == "screen":
+            start_center = offset_pair(params.get("movement_start_center", [0, 0]))
+        start_dx, start_dy = random_circle_offset(
+            max(0, int(params.get("movement_start_radius", 0) or 0)),
+            random_source,
+        )
+        click_offset = offset_pair(params.get("click_offset", [0, 0]))
+        duration = max(0.0, float(params.get("movement_duration", 0.5) or 0.0))
+        points = humanized_mouse_points(
+            [
+                (start_center[0] + start_dx, start_center[1] + start_dy, 0.0),
+                (center_x + click_offset[0], center_y + click_offset[1], duration),
+            ],
+            endpoint_radius=max(0, int(params.get("click_radius", 0) or 0)),
+            path_variance=max(0.0, float(params.get("path_variance", 0.0) or 0.0)),
+            timing_variance_min=0.0,
+            timing_variance_max=0.0,
+            rng=random_source,
+        )
+        if current_bounds is not None:
+            return [(*clamp_point(x, y, current_bounds), relative_time) for x, y, relative_time in points]
+        return points
+
     points = []
     for point in params.get("movement_path", []) or []:
         if len(point) >= 3:
@@ -839,6 +966,18 @@ def offset_pair(value):
     if not isinstance(value, (list, tuple)) or len(value) < 2:
         return (0, 0)
     return (int(value[0]), int(value[1]))
+
+
+def random_circle_offset(radius, rng=None):
+    random_source = rng or random
+    radius = max(0, int(radius))
+    if radius <= 0:
+        return (0, 0)
+    while True:
+        dx = random_source.randint(-radius, radius)
+        dy = random_source.randint(-radius, radius)
+        if (dx * dx) + (dy * dy) <= radius * radius:
+            return (dx, dy)
 
 
 def apply_image_movement_button(params, mouse_controller, mouse, stage, held_buttons=None):
@@ -913,6 +1052,98 @@ def interpolated_mouse_points(points, hz=60):
     return output
 
 
+def humanized_mouse_points(
+    points,
+    hz=60,
+    endpoint_radius=5,
+    path_variance=2.0,
+    timing_variance_min=0.1,
+    timing_variance_max=0.2,
+    rng=None,
+):
+    base_points = interpolated_mouse_points(points, hz=hz)
+    if len(base_points) <= 1:
+        return base_points
+
+    random_source = rng or random
+    radius = max(0, int(endpoint_radius))
+    endpoint_dx, endpoint_dy = random_circle_offset(radius, random_source)
+
+    minimum_timing_variance = max(0.0, float(timing_variance_min))
+    maximum_timing_variance = max(minimum_timing_variance, float(timing_variance_max))
+    timing_variance = random_source.uniform(minimum_timing_variance, maximum_timing_variance)
+    base_duration = max(0.0, float(base_points[-1][2]))
+    if base_duration > timing_variance and random_source.random() < 0.5:
+        varied_duration = base_duration - timing_variance
+    else:
+        varied_duration = base_duration + timing_variance
+
+    maximum_wiggle = max(0.0, float(path_variance))
+    primary_amplitude = random_source.uniform(maximum_wiggle * 0.35, maximum_wiggle * 0.75)
+    secondary_amplitude = random_source.uniform(maximum_wiggle * 0.1, maximum_wiggle * 0.25)
+    primary_phase = random_source.uniform(0.0, math.tau)
+    secondary_phase = random_source.uniform(0.0, math.tau)
+
+    output = []
+    last_index = len(base_points) - 1
+    for index, (x, y, relative_time) in enumerate(base_points):
+        if base_duration > 0:
+            progress = min(1.0, max(0.0, float(relative_time) / base_duration))
+        else:
+            progress = index / last_index
+        previous = base_points[max(0, index - 1)]
+        following = base_points[min(last_index, index + 1)]
+        tangent_x = float(following[0] - previous[0])
+        tangent_y = float(following[1] - previous[1])
+        tangent_length = math.hypot(tangent_x, tangent_y)
+        if tangent_length:
+            normal_x = -tangent_y / tangent_length
+            normal_y = tangent_x / tangent_length
+        else:
+            normal_x = 0.0
+            normal_y = 0.0
+        taper = math.sin(math.pi * progress)
+        wiggle = taper * (
+            primary_amplitude * math.sin((math.tau * progress) + primary_phase)
+            + secondary_amplitude * math.sin((2.0 * math.tau * progress) + secondary_phase)
+        )
+        endpoint_ease = progress * progress * (3.0 - (2.0 * progress))
+        varied_x = round(float(x) + (endpoint_dx * endpoint_ease) + (normal_x * wiggle))
+        varied_y = round(float(y) + (endpoint_dy * endpoint_ease) + (normal_y * wiggle))
+        output.append((varied_x, varied_y, varied_duration * progress))
+
+    output[0] = (int(base_points[0][0]), int(base_points[0][1]), 0.0)
+    output[-1] = (
+        int(base_points[-1][0]) + endpoint_dx,
+        int(base_points[-1][1]) + endpoint_dy,
+        varied_duration,
+    )
+    return output
+
+
+def playback_mouse_points(action, current_bounds, rng=None, start_override=None):
+    points = mouse_move_points(action)
+    if not bool(action.get("params", {}).get("humanize_playback", False)):
+        return interpolated_mouse_points(points)
+    if points and start_override is not None:
+        points[0] = (int(start_override[0]), int(start_override[1]), points[0][2])
+    return [
+        (*clamp_point(x, y, current_bounds), relative_time)
+        for x, y, relative_time in humanized_mouse_points(points, rng=rng)
+    ]
+
+
+def resolved_mouse_target(params, runtime_state):
+    target = (int(params.get("x", 0)), int(params.get("y", 0)))
+    source = runtime_state.get("humanized_mouse_source")
+    destination = runtime_state.get("humanized_mouse_destination")
+    if source is not None and destination is not None and target == tuple(source):
+        return tuple(destination)
+    runtime_state["humanized_mouse_source"] = None
+    runtime_state["humanized_mouse_destination"] = None
+    return target
+
+
 def sleep_until(target, stop_event):
     while True:
         if stop_event.is_set():
@@ -931,21 +1162,70 @@ def clamp_loop_count(value):
     return min(99999, max(1, count))
 
 
+def macro_loop_delay_range(settings, minimum_override=None, maximum_override=None):
+    mode = str(settings.get("macro_loop_delay_mode", "none")).lower()
+    if minimum_override is not None or maximum_override is not None:
+        mode = "random"
+    if mode not in {"none", "fixed", "random"}:
+        mode = "none"
+    minimum_value = settings.get("macro_loop_delay_min", 0.0) if minimum_override is None else minimum_override
+    if maximum_override is not None:
+        maximum_value = maximum_override
+    elif minimum_override is not None:
+        maximum_value = minimum_override
+    else:
+        maximum_value = settings.get("macro_loop_delay_max", minimum_value)
+    try:
+        minimum = min(86400.0, max(0.0, float(minimum_value)))
+    except (TypeError, ValueError):
+        minimum = 0.0
+    try:
+        maximum = min(86400.0, max(0.0, float(maximum_value)))
+    except (TypeError, ValueError):
+        maximum = minimum
+    if minimum > maximum:
+        minimum, maximum = maximum, minimum
+    if mode == "none":
+        return (0.0, 0.0)
+    if mode == "fixed":
+        return (minimum, minimum)
+    return (minimum, maximum)
+
+
 def main():
+    # DPI awareness must be configured before hiding the double-click console.
+    # A User32 call made first can lock the process into DPI-virtualized coordinates.
+    set_dpi_awareness()
     parser = argparse.ArgumentParser(description="Run an exported Macro Recorder + macro.")
     parser.add_argument("--speed", type=float, default=None, help="Override the saved playback speed.")
     parser.add_argument("--loops", type=int, default=None, help="Override the saved whole-macro loop count.")
+    parser.add_argument("--loop-delay-min", type=float, default=None, help="Override the minimum seconds between macro loops.")
+    parser.add_argument("--loop-delay-max", type=float, default=None, help="Override the maximum seconds between macro loops.")
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--start-action", type=int, default=0)
+    parser.add_argument("--start-action", type=int, default=None)
     parser.add_argument("--end-action", type=int, default=None, help="Stop before this zero-based action index.")
     parser.add_argument("--install-deps", action="store_true", help="Install runtime dependencies into the local export folder.")
     parser.add_argument("--no-hotkey", action="store_true", help="Disable the F10 emergency-stop listener.")
+    parser.add_argument("--log-file", type=str, default="", help="Write console output to this file.")
     args = parser.parse_args()
+
+    dedicated_console = is_dedicated_console_launch()
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+    log_handle = None
+    log_file = args.log_file or (str(RUNTIME_DIR / f"{Path(__file__).stem}.log") if dedicated_console else "")
+    if log_file:
+        log_path = Path(log_file).expanduser()
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_handle = log_path.open("w", encoding="utf-8", buffering=1)
+        sys.stdout = log_handle
+        sys.stderr = log_handle
+    if dedicated_console:
+        hide_console_window()
 
     if args.install_deps:
         return install_dependencies()
 
-    set_dpi_awareness()
     speed = max(
         0.01,
         float(args.speed if args.speed is not None else MACRO.get("settings", {}).get("playback_speed", 1.0)),
@@ -961,8 +1241,13 @@ def main():
     mouse_controller = None
     keyboard = None
     mouse = None
+    pending_window_placement = None
+    pending_window_auto_focus = False
 
     if not args.dry_run:
+        if not ensure_dependencies():
+            print("Unable to install the required export dependencies.", file=sys.stderr)
+            return 2
         keyboard, mouse = import_input_modules()
         if keyboard is None or mouse is None:
             return 2
@@ -993,6 +1278,8 @@ def main():
 
     def begin_macro_loop():
         release_all()
+        runtime_state["humanized_mouse_source"] = None
+        runtime_state["humanized_mouse_destination"] = None
         if args.dry_run or mouse_controller is None:
             return
         cursor_start = recorded_environment.get("cursor_start")
@@ -1009,8 +1296,12 @@ def main():
     try:
         main_actions = MACRO["actions"]
         pre_actions = MACRO.get("pre_actions", [])
-        runtime_state = {"last_image_found": None}
-        main_start_index = max(0, args.start_action)
+        runtime_state = {
+            "last_image_found": None,
+            "humanized_mouse_source": None,
+            "humanized_mouse_destination": None,
+        }
+        main_start_index = max(0, args.start_action or 0)
         main_end_index = (
             len(main_actions)
             if args.end_action is None
@@ -1021,6 +1312,11 @@ def main():
         start_index = 0 if running_pre_actions else main_start_index
         macro_loop_count = clamp_loop_count(
             args.loops if args.loops is not None else MACRO.get("settings", {}).get("macro_loop_count", 1)
+        )
+        loop_delay_minimum, loop_delay_maximum = macro_loop_delay_range(
+            MACRO.get("settings", {}),
+            args.loop_delay_min,
+            args.loop_delay_max,
         )
         macro_loop_index = -1 if running_pre_actions else 0
         loop_needs_initialization = not running_pre_actions
@@ -1040,6 +1336,12 @@ def main():
                 macro_loop_index += 1
                 if macro_loop_index >= macro_loop_count:
                     break
+                loop_delay = random.uniform(loop_delay_minimum, loop_delay_maximum)
+                if loop_delay > 0:
+                    print(f"Waiting {loop_delay:.2f}s before macro loop {macro_loop_index + 1} of {macro_loop_count}")
+                    if not args.dry_run and not sleep_until(time.perf_counter() + loop_delay, stop_event):
+                        print("Emergency stop requested", file=sys.stderr)
+                        return 130
                 runtime_state["last_image_found"] = None
                 loop_needs_initialization = True
                 index = start_index
@@ -1055,6 +1357,9 @@ def main():
             if not action.get("enabled", True):
                 if action.get("type") == "image_click":
                     runtime_state["last_image_found"] = None
+                if action.get("type") == "mouse_move":
+                    runtime_state["humanized_mouse_source"] = None
+                    runtime_state["humanized_mouse_destination"] = None
                 index = next_index
                 continue
             for _loop_index in range(clamp_loop_count(action.get("loop_count", 1))):
@@ -1083,13 +1388,25 @@ def main():
                     if not sleep_until(time.perf_counter() + seconds, stop_event):
                         print("Emergency stop requested", file=sys.stderr)
                         return 130
+                    if pending_window_placement:
+                        placement_restored = arrange_existing_window(
+                            pending_window_placement,
+                            auto_focus=pending_window_auto_focus,
+                            timeout=2.0,
+                        )
+                        print(f"Window placement reapplied after startup wait: {placement_restored}")
+                        pending_window_placement = None
+                        pending_window_auto_focus = False
                 elif action_type == "open_url":
                     webbrowser.open(params["url"])
                     if params.get("window_placement"):
-                        arrange_existing_window(
-                            params["window_placement"],
-                            auto_focus=bool(params.get("auto_focus", False)),
+                        pending_window_placement = params["window_placement"]
+                        pending_window_auto_focus = bool(params.get("auto_focus", False))
+                        placement_applied = arrange_existing_window(
+                            pending_window_placement,
+                            auto_focus=pending_window_auto_focus,
                         )
+                        print(f"Initial window placement applied: {placement_applied}")
                 elif action_type == "open_file":
                     open_file_with_default_app(
                         params.get("file_path", ""),
@@ -1145,14 +1462,30 @@ def main():
                         keyboard_controller.release(key)
                         held_keys.pop()
                 elif action_type == "mouse_move":
+                    source_points = mouse_move_points(runtime_action)
+                    start_override = None
+                    if source_points:
+                        source_start = (source_points[0][0], source_points[0][1])
+                        if runtime_state.get("humanized_mouse_source") == source_start:
+                            start_override = runtime_state.get("humanized_mouse_destination")
+                    runtime_state["humanized_mouse_source"] = None
+                    runtime_state["humanized_mouse_destination"] = None
+                    playback_points = playback_mouse_points(
+                        runtime_action,
+                        current_bounds,
+                        start_override=start_override,
+                    )
                     start_time = time.perf_counter()
-                    for x, y, relative_time in interpolated_mouse_points(mouse_move_points(runtime_action)):
+                    for x, y, relative_time in playback_points:
                         if not sleep_until(start_time + (relative_time / speed), stop_event):
                             print("Emergency stop requested", file=sys.stderr)
                             return 130
                         position_mouse(mouse_controller, x, y)
+                    if params.get("humanize_playback", False) and source_points and playback_points:
+                        runtime_state["humanized_mouse_source"] = source_points[-1][:2]
+                        runtime_state["humanized_mouse_destination"] = playback_points[-1][:2]
                 elif action_type == "mouse_button":
-                    position_mouse(mouse_controller, params.get("x", 0), params.get("y", 0))
+                    position_mouse(mouse_controller, *resolved_mouse_target(params, runtime_state))
                     button = button_from_name(params.get("button", "left"), mouse)
                     phase = params.get("phase", "click")
                     if phase == "press":
@@ -1165,9 +1498,11 @@ def main():
                         mouse_controller.press(button)
                         mouse_controller.release(button)
                 elif action_type == "scroll":
-                    position_mouse(mouse_controller, params.get("x", 0), params.get("y", 0))
+                    position_mouse(mouse_controller, *resolved_mouse_target(params, runtime_state))
                     mouse_controller.scroll(int(params.get("dx", 0)), int(params.get("dy", 0)))
                 elif action_type == "image_click":
+                    runtime_state["humanized_mouse_source"] = None
+                    runtime_state["humanized_mouse_destination"] = None
                     image_found = execute_image_click(params, mouse_controller, mouse, stop_event, held_buttons, speed)
                     if image_found is None:
                         print("Emergency stop requested", file=sys.stderr)
@@ -1186,6 +1521,7 @@ def main():
         return 130
     except Exception as exc:
         print(f"Playback failed: {exc}", file=sys.stderr)
+        traceback.print_exc()
         return 1
     finally:
         if hotkey_listener is not None:
@@ -1194,6 +1530,11 @@ def main():
             except Exception:
                 pass
         release_all()
+        if log_handle is not None:
+            log_handle.flush()
+            sys.stdout = original_stdout
+            sys.stderr = original_stderr
+            log_handle.close()
 
 
 if __name__ == "__main__":
@@ -1201,7 +1542,7 @@ if __name__ == "__main__":
 '''
         return (
             dedent(template)
-            .replace("__RUNTIME_DIR_NAME__", RUNTIME_DIR_NAME)
+            .replace("__RUNTIME_RELATIVE_PATH__", repr(str(runtime_relative_path)))
             .replace("__DEPENDENCIES_DIR_NAME__", DEPENDENCIES_DIR_NAME)
             .replace("__REQUIRED_PACKAGES__", repr(list(RUNTIME_REQUIREMENTS)))
             .replace("__MACRO_JSON__", repr(payload))
@@ -1212,14 +1553,29 @@ if __name__ == "__main__":
         if target.suffix.lower() != ".py":
             target = target.with_suffix(".py")
         target.parent.mkdir(parents=True, exist_ok=True)
-        export_document = self._document_with_export_assets(document, target)
-        target.write_text(self.render(export_document), encoding="utf-8")
-        self.write_support_files(target)
+        return self._write_export(document, target, support_dir=export_support_directory(target))
+
+    def _write_export(self, document: MacroDocument, target: Path, *, support_dir: Path) -> Path:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        export_document = self._document_with_export_assets(document, target, support_dir=support_dir)
+        runtime_dir = support_dir / RUNTIME_DIR_NAME
+        runtime_relative_path = Path(os.path.relpath(runtime_dir, target.parent))
+        target.write_text(
+            self.render(export_document, runtime_relative_path=runtime_relative_path),
+            encoding="utf-8",
+        )
+        self.write_support_files(target, support_dir=support_dir)
         return target
 
-    def _document_with_export_assets(self, document: MacroDocument, target: Path) -> MacroDocument:
+    def _document_with_export_assets(
+        self,
+        document: MacroDocument,
+        target: Path,
+        *,
+        support_dir: Path | None = None,
+    ) -> MacroDocument:
         export_document = MacroDocument.from_dict(document.to_dict())
-        asset_dir = target.parent / ASSETS_DIR_NAME
+        asset_dir = (support_dir or target.parent) / ASSETS_DIR_NAME
         for action in [*export_document.pre_actions, *export_document.actions]:
             if action.type != ActionType.IMAGE_CLICK:
                 continue
@@ -1235,7 +1591,7 @@ if __name__ == "__main__":
             destination = self._unique_asset_path(asset_dir, source, action.id)
             if source.resolve() != destination.resolve():
                 shutil.copy2(source, destination)
-            action.params["image_path"] = str(Path(ASSETS_DIR_NAME) / destination.name)
+            action.params["image_path"] = os.path.relpath(destination, target.parent)
         return export_document
 
     def _unique_asset_path(self, asset_dir: Path, source: Path, action_id: str) -> Path:
@@ -1248,15 +1604,17 @@ if __name__ == "__main__":
             counter += 1
         return candidate
 
-    def write_support_files(self, target: str | Path) -> None:
+    def write_support_files(self, target: str | Path, *, support_dir: str | Path | None = None) -> None:
         target = Path(target)
-        runtime_dir = target.parent / RUNTIME_DIR_NAME
+        support_dir = Path(support_dir) if support_dir is not None else target.parent
+        runtime_dir = support_dir / RUNTIME_DIR_NAME
         runtime_dir.mkdir(parents=True, exist_ok=True)
         (runtime_dir / "requirements.txt").write_text("\n".join(RUNTIME_REQUIREMENTS) + "\n", encoding="utf-8")
         (runtime_dir / "install_dependencies.bat").write_text(self._install_batch(), encoding="utf-8")
-        (target.parent / safe_batch_filename(target)).write_text(self._run_batch(target), encoding="utf-8")
-        readme = target.parent / "README_exported_macros.txt"
-        readme.write_text(self._readme_text(), encoding="utf-8")
+        if support_dir == target.parent:
+            (target.parent / safe_batch_filename(target)).write_text(self._run_batch(target), encoding="utf-8")
+        readme = support_dir / "README_exported_macros.txt"
+        readme.write_text(self._readme_text(single_file=support_dir != target.parent), encoding="utf-8")
 
     def _install_batch(self) -> str:
         python_exe = str(Path(self.python_executable))
@@ -1296,7 +1654,26 @@ if __name__ == "__main__":
             f'"%PYTHON_EXE%" "%~dp0{target.name}" %*\n'
         )
 
-    def _readme_text(self) -> str:
+    def _readme_text(self, *, single_file: bool = False) -> str:
+        if single_file:
+            return dedent(
+                '''\
+                Macro Recorder + exported Python macros
+
+                Double-click the exported .py file on the Desktop. Required packages are installed
+                automatically into misc/macro_recorder_plus_runtime on first run.
+                Image recognition templates are stored under misc/macro_recorder_plus_assets.
+
+                Useful direct commands:
+                  python your_macro.py --dry-run
+                  python your_macro.py --speed 1.5
+                  python your_macro.py --loop-delay-min 1 --loop-delay-max 2
+                  python your_macro.py --start-action 12
+
+                Secret actions read from environment variables in this process.
+                Press F10 while a macro is running to request an emergency stop.
+                '''
+            )
         return dedent(
             '''\
             Macro Recorder + exported Python macros
@@ -1309,6 +1686,7 @@ if __name__ == "__main__":
               python your_macro.py --install-deps
               python your_macro.py --dry-run
               python your_macro.py --speed 1.5
+              python your_macro.py --loop-delay-min 1 --loop-delay-max 2
               python your_macro.py --start-action 12
 
             Secret actions read from environment variables in this process. For example:

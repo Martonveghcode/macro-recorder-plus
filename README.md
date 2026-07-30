@@ -10,16 +10,32 @@ The macro recorder that actually works. Windows desktop app built with Python an
 
 ## Highlights
 
-- Record keyboard input, mouse clicks, mouse movement, and scroll actions from the desktop.
+- Record keyboard input, mouse clicks, mouse movement, and scroll actions from the desktop; recording appends after existing main actions instead of replacing the macro.
 - Automatically capture modifier chords such as Ctrl+C, Ctrl+V, Ctrl+X, Alt+Tab, and Ctrl+Shift+S as keyboard-shortcut actions.
 - Edit recorded steps as structured actions before playback, including per-action loop counts up to 99,999 repeats.
 - Add manual actions for URLs, local files, launched programs, typed text, secrets, image clicks, custom image-relative mouse movement, waits, and comments.
 - Export macros as standalone Python scripts with runtime dependency files and a generated `run_*.bat` launcher.
 - Build optional Windows executables through PyInstaller from inside the app.
 - Store secrets by environment variable name so passwords are not written into macro files.
-- Configure whole-macro loop counts, playback speed, countdowns, hotkeys, theme, accent color, and widget corner shape.
+- Configure whole-macro loop counts, fixed or randomized pauses between loops, playback speed, countdowns, hotkeys, theme, accent color, and widget corner shape.
 - Keep one-time setup steps in a separate pre-action list, so apps and documents open once before a repeating main macro.
 - Capture an open app window's monitor, position, size, and maximized state for exact restoration during playback.
+- Give image clicks a visual start circle and click circle, a smooth randomized mouse path, and a configurable move duration.
+
+## Appending recordings
+
+**Record** and **Recording Setup** preserve the current macro, pre-actions, name, file path, and settings. New recorded actions are added after the final main action. On an empty macro, recording initializes the recorded desktop and cursor anchor as before.
+
+## Natural image clicks
+
+New **Find Image and Click** actions enable natural randomized movement by default. In the action properties you can:
+
+- start within a radius around the current cursor or pick a fixed start-circle center on screen;
+- set a click-center offset and radius while viewing the red target circle over the actual image;
+- set a smooth curve amount and exact movement duration; and
+- use the same movement with left, right, middle, double-click, move-only, or legacy custom button actions.
+
+Imported macros retain their prior exact image-click and custom-offset behavior. Saving or exporting them writes the current fields without requiring a separate conversion step. Selected image-search regions use native physical pixels and full virtual-desktop capture, including secondary monitors with negative coordinates.
 
 ## Install
 
@@ -63,11 +79,14 @@ python exported_macro.py
 python exported_macro.py --install-deps
 python exported_macro.py --speed 1.5
 python exported_macro.py --loops 3
+python exported_macro.py --loop-delay-min 1 --loop-delay-max 2
 python exported_macro.py --dry-run
 python exported_macro.py --start-action 12
 ```
 
 Use **Export Windows EXE** to export the Python script first, then run PyInstaller through the GUI. PyInstaller is optional and is listed in `requirements-dev.txt`.
+
+The **Between loops** dropdown beside the whole-macro loop setting offers no pause, a fixed pause, or a random range. Random mode chooses a fresh duration after every completed whole-macro loop except the final loop. The setting is saved in the macro and carried into Python and EXE exports. Older macros default to no pause.
 
 ## Export Settings
 

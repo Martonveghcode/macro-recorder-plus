@@ -53,6 +53,38 @@ def test_each_macro_loop_reuses_exact_recorded_cursor_anchor(monkeypatch):
     assert finished == [(True, "Playback complete (100 loops)")]
 
 
+def test_random_delay_is_chosen_between_each_whole_macro_loop(monkeypatch):
+    mouse = RecordingMouseController()
+    _install_fake_pynput(monkeypatch, mouse)
+    environment = RecordedEnvironment()
+    worker = PlaybackWorker(
+        [create_action(ActionType.COMMENT)],
+        repeat_count=3,
+        loop_delay_min=1.0,
+        loop_delay_max=2.0,
+        recorded_environment=environment,
+        current_environment_snapshot=environment,
+    )
+    chosen_ranges = []
+    waits = []
+    statuses = []
+
+    def fake_uniform(minimum, maximum):
+        chosen_ranges.append((minimum, maximum))
+        return 1.25 if len(chosen_ranges) == 1 else 1.75
+
+    monkeypatch.setattr(playback_worker.random, "uniform", fake_uniform)
+    monkeypatch.setattr(worker, "_wait_seconds", lambda seconds, mouse_controller: waits.append(seconds) or True)
+    worker.status.connect(statuses.append)
+
+    worker.run()
+
+    assert chosen_ranges == [(1.0, 2.0), (1.0, 2.0)]
+    assert [seconds for seconds in waits if seconds > 0] == [1.25, 1.75]
+    assert "Waiting 1.25s before macro loop 2 of 3" in statuses
+    assert "Waiting 1.75s before macro loop 3 of 3" in statuses
+
+
 def test_coordinate_transform_does_not_mutate_or_drift_between_loops():
     recorded = RecordedEnvironment(virtual_desktop=Rect(0, 0, 100, 100))
     current = RecordedEnvironment(virtual_desktop=Rect(-200, 0, 200, 200))
