@@ -85,6 +85,56 @@ def test_random_delay_is_chosen_between_each_whole_macro_loop(monkeypatch):
     assert "Waiting 1.75s before macro loop 3 of 3" in statuses
 
 
+@pytest.mark.parametrize(
+    ("actions", "expected_chain_flags"),
+    [
+        ([create_action(ActionType.IMAGE_CLICK)], [False]),
+        ([create_action(ActionType.IMAGE_CLICK) for _ in range(3)], [False, True, True]),
+        (
+            [
+                create_action(ActionType.IMAGE_CLICK),
+                create_action(ActionType.COMMENT),
+                create_action(ActionType.IMAGE_CLICK),
+            ],
+            [False, False],
+        ),
+        (
+            [
+                MacroAction(type=ActionType.IMAGE_CLICK, params={"natural_movement": False}),
+                create_action(ActionType.IMAGE_CLICK),
+            ],
+            [False, False],
+        ),
+    ],
+)
+def test_only_consecutive_natural_image_actions_are_chained(monkeypatch, actions, expected_chain_flags):
+    worker = PlaybackWorker(actions, current_environment_snapshot=RecordedEnvironment())
+    mouse = RecordingMouseController()
+    chain_flags = []
+
+    def fake_play_image_click(action, executor, mouse_controller, *, chain_from_previous_image=False):
+        chain_flags.append(chain_from_previous_image)
+        return True
+
+    monkeypatch.setattr(worker, "_play_image_click", fake_play_image_click)
+    monkeypatch.setattr(worker, "_wait_while_paused_or_stopped", lambda mouse_controller: False)
+    monkeypatch.setattr(worker, "_wait_seconds", lambda seconds, mouse_controller: True)
+
+    completed, final_index = worker._play_range(
+        actions,
+        0,
+        len(actions),
+        0,
+        SimpleNamespace(execute=lambda action: None),
+        mouse,
+        worker.progress,
+    )
+
+    assert completed is True
+    assert final_index == len(actions)
+    assert chain_flags == expected_chain_flags
+
+
 def test_coordinate_transform_does_not_mutate_or_drift_between_loops():
     recorded = RecordedEnvironment(virtual_desktop=Rect(0, 0, 100, 100))
     current = RecordedEnvironment(virtual_desktop=Rect(-200, 0, 200, 200))

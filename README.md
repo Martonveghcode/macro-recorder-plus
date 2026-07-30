@@ -35,6 +35,8 @@ New **Find Image and Click** actions enable natural randomized movement by defau
 - set a smooth curve amount and exact movement duration; and
 - use the same movement with left, right, middle, double-click, move-only, or legacy custom button actions.
 
+Consecutive natural image-click actions are joined automatically: after one image is clicked, the pointer follows a short randomized 0.3–0.8 second curve into the next action's randomly selected start-circle point instead of teleporting. A standalone image action is unchanged.
+
 Imported macros retain their prior exact image-click and custom-offset behavior. Saving or exporting them writes the current fields without requiring a separate conversion step. Selected image-search regions use native physical pixels and full virtual-desktop capture, including secondary monitors with negative coordinates.
 
 ## Install

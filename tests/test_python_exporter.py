@@ -16,11 +16,11 @@ from macro_recorder_plus.exporters.python_exporter import (
     PythonExporter,
     export_support_directory,
 )
-from macro_recorder_plus.models.actions import ActionType, MacroAction
+from macro_recorder_plus.models.actions import ActionType, MacroAction, create_action
 from macro_recorder_plus.models.environment import RecordedEnvironment, Rect
 from macro_recorder_plus.models.macro import MacroDocument
 from macro_recorder_plus.platform.windows_input import image_movement_points_for_match
-from macro_recorder_plus.utilities.mouse_path import humanized_path_points
+from macro_recorder_plus.utilities.mouse_path import humanized_path_points, image_chain_transition_points
 
 
 def test_python_export_contains_cli_options_and_macro_data(tmp_path):
@@ -300,6 +300,28 @@ def test_python_export_preserves_natural_image_start_and_click_circles(tmp_path)
     )
 
     assert exported_points == app_points
+
+
+def test_python_export_preserves_consecutive_image_transition_behavior(tmp_path):
+    document = MacroDocument(
+        name="chained image actions",
+        actions=[create_action(ActionType.IMAGE_CLICK), create_action(ActionType.IMAGE_CLICK)],
+    )
+    path = PythonExporter().export(document, tmp_path / "chained_images.py")
+    exported = runpy.run_path(str(path))
+    text = path.read_text(encoding="utf-8")
+
+    exported_points = exported["image_chain_transition_points"](
+        (120, 80),
+        (700, 420),
+        rng=random.Random(7),
+    )
+    app_points = image_chain_transition_points((120, 80), (700, 420), rng=random.Random(7))
+
+    assert exported_points == app_points
+    assert 0.3 <= exported_points[-1][2] <= 0.8
+    assert 'runtime_state["previous_natural_image_index"]' in text
+    assert "chain_from_previous_image=(chain_from_previous_image and action_loop_index == 0)" in text
 
 
 def test_python_export_runs_pre_actions_once_before_looped_actions(tmp_path):
