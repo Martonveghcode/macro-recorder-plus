@@ -121,3 +121,7 @@ If the variable is missing, GUI playback errors. Exported scripts prompt only wh
 ## License
 
 No license file is included yet. Add one before distributing this as an open source project or accepting outside contributions.
+
+---
+
+Built by [Marton Vegh](https://marton.top/). Read the [project case study](https://marton.top/projects/macro-recorder-plus/).
